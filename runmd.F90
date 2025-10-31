@@ -2066,7 +2066,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #ifdef MPI
     if (numtasks > 1) then
       fires_enabled_any(1) = fires_restraint_enabled_local
-      call mpi_allreduce(fires_enabled_any, fires_enabled_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
+      call mpi_allreduce(MPI_IN_PLACE, fires_enabled_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
       fires_restraint_enabled_global = fires_enabled_any(1)
       mask_flag_local = 0
       if (fires_restraint_enabled_local) mask_flag_local = 1
@@ -2183,8 +2183,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       mts_n_max = mts_n_local
 #ifdef MPI
       if (numtasks > 1) then
-        call mpi_allreduce(mts_n_min, mts_n_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
-        call mpi_allreduce(mts_n_max, mts_n_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+        call mpi_allreduce(MPI_IN_PLACE, mts_n_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+        call mpi_allreduce(MPI_IN_PLACE, mts_n_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
         if (mts_n_min .ne. mts_n_max) then
           if (master) write(6,'(a,i8,a,i8)') 'FIRES ERROR: mts_n diverged across ranks: ', mts_n_min, ' vs ', mts_n_max
           call mexit(6, 1)
@@ -2229,7 +2229,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       if (numtasks > 1) then
         early_exit_any(1) = early_exit_local
         if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce early_exit nstep=', nstep, ' sub=0'
-        call mpi_allreduce(early_exit_any, early_exit_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
+        call mpi_allreduce(MPI_IN_PLACE, early_exit_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
         early_exit_global = early_exit_any(1)
         if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,l1)') 'DBG[MTS]: exit reduce early_exit nstep=', nstep, ' sub=0 value=', early_exit_global
       end if
@@ -2387,7 +2387,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
             end if
             if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce early_exit nstep=', nstep, ' sub=', sub
             early_exit_any(1) = early_exit_local
-            call mpi_allreduce(early_exit_any, early_exit_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
+            call mpi_allreduce(MPI_IN_PLACE, early_exit_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
             early_exit_global = early_exit_any(1)
             if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,l1)') 'DBG[MTS]: exit reduce early_exit nstep=', nstep, ' sub=', sub, ' value=', early_exit_global
           end if
