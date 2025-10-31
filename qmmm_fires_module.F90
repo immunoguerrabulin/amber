@@ -22,6 +22,10 @@ module qmmm_fires_module
 !    fires_k = (force constant for the boundary potential)
 !+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     use findmask
+#ifdef MPI
+#  include "parallel.h"
+  include 'mpif.h'
+#endif
     implicit none
     private
     public :: FireMasks, calculate_fires_force, fires_force, setup_fires, fires_set_local_bounds, fires_restraint_enabled, fires_prepare_if_needed, fires_mask_signature
@@ -387,65 +391,94 @@ contains
 
     ! Return the FIRES center: either a designated core atom or the COM of inner mask
     subroutine get_center(x, mass, center)
-            use memory_module, only : natom
         implicit none
         _REAL_, intent(in)  :: x(*), mass(*)
         _REAL_, intent(out) :: center(3)
         integer :: a, i, atom_index, ref_idx, aref
-        _REAL_ :: msum, rref(3), dr(3), rimag(3)
+        integer :: have_ref_local, have_ref_global
+        _REAL_ :: msum_local, msum_global
+        _REAL_ :: rref(3), dr(3), rimag(3)
+        _REAL_ :: center_local(3), center_global(3)
+#ifdef MPI
+        integer :: ierr
+#endif
 #include "../include/md.h"
 
-        msum = 0.d0
-        rref = 0.d0
-        dr = 0.d0
-        rimag = 0.d0
-        a = 0
-        i = 0
-        atom_index = 0
-        ref_idx = 0
-        aref = 0
-        center = 0.d0
-        
+        center = 0.0d0
+        rref = 0.0d0
+        dr = 0.0d0
+        rimag = 0.0d0
+        center_local = 0.0d0
+        center_global = 0.0d0
+        msum_local = 0.0d0
+        msum_global = 0.0d0
+        have_ref_local = 0
+        have_ref_global = 0
+
         if (fires_center_atom > 0) then
-            a = 3*fires_center_atom - 2
-            center = x(a:a+2)
+            ref_idx = fires_center_atom
+        else if (size(masks%inner_mask) > 0) then
+            ref_idx = masks%inner_mask(1)
+        else
             return
         end if
 
-        ! Fallback: COM of inner mask (same logic as center_of_mass)
-        center = 0.0D0
-        msum   = 0.0D0
-        if (size(masks%inner_mask) <= 0) return
-        ref_idx = masks%inner_mask(1)
         if (ref_idx <= 0) return
         aref = 3*ref_idx - 2
-        rref = x(aref:aref+2)
+        if (aref >= g_loc_istart3 .and. aref+2 <= g_loc_iend3) then
+            rref = x(aref:aref+2)
+            have_ref_local = 1
+        end if
+#ifdef MPI
+        call mpi_allreduce(have_ref_local, have_ref_global, 1, MPI_INTEGER, mpi_sum, commsander, ierr)
+        call mpi_allreduce(rref, rref, 3, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+#else
+        have_ref_global = have_ref_local
+#endif
+
+        if (have_ref_global <= 0) return
+
+        if (fires_center_atom > 0) then
+            center = rref
+            return
+        end if
+
+        if (size(masks%inner_mask) <= 0) return
 
         i = 1
         do while (i <= size(masks%inner_mask))
             atom_index = masks%inner_mask(i)
             if (atom_index .gt. 0) then
                 a = 3*atom_index - 2
-                dr = x(a:a+2) - rref
-
-                call min_image_vec(dr)
-                rimag = rref + dr
-                center = center + mass(atom_index) * rimag
-                msum   = msum   + mass(atom_index)
+                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                    dr = x(a:a+2) - rref
+                    call min_image_vec(dr)
+                    rimag = rref + dr
+                    center_local = center_local + mass(atom_index) * rimag
+                    msum_local = msum_local + mass(atom_index)
+                end if
             else
                 exit
             end if
             i = i + 1
         end do
-        if (msum > 0.0D0) then
-            center = center / msum
+
+#ifdef MPI
+        call mpi_allreduce(center_local, center_global, 3, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+        call mpi_allreduce(msum_local, msum_global, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+#else
+        center_global = center_local
+        msum_global = msum_local
+#endif
+
+        if (msum_global > 0.0D0) then
+            center = center_global / msum_global
         else
             ! Fallback: if there is exactly one inner atom, use its coordinate even if massless
             if (size(masks%inner_mask) == 1) then
                 atom_index = masks%inner_mask(1)
                 if (atom_index > 0) then
-                    a = 3*atom_index - 2
-                    center = x(a:a+2)
+                    center = rref
                 end if
             end if
             if (.not. fires_notice_printed) then
@@ -554,6 +587,9 @@ contains
 #include "../include/md.h"
 
         ! locals
+#ifdef MPI
+        integer :: ierr
+#endif
     _REAL_ :: com(3)
     _REAL_ :: r, rmax, delta, ui(3), dr(3)
         _REAL_ :: r_inw_max
@@ -577,6 +613,11 @@ contains
     ! Effective inner list skipping zero-mass (e.g. TIP4P extra points)
     integer, allocatable :: inner_eff(:)
     integer :: n_inner_eff
+    _REAL_ :: pre_inw_max_r_glob, pre_out_min_r_glob
+    _REAL_ :: f_react_com_glob(3), m_tot_inner_glob
+    _REAL_ :: rmax_local
+    integer :: j_anchor_local, anchor_candidate
+    _REAL_ :: anchor_tol
 
         ! Initialize accumulators (do not zero caller's force buffer here;
         ! callers are responsible for clearing when needed)
@@ -651,12 +692,14 @@ contains
             atom_index = masks%inner_solvent_mask(i)
             if (atom_index .gt. 0) then
                 a = 3*atom_index - 2
-                dr = x(a:a+2) - com
-                call min_image_vec(dr)
-                r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
-                if (r > pre_inw_max_r) then
-                    pre_inw_max_r = r
-                    pre_inw_max_idx = atom_index
+                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                    dr = x(a:a+2) - com
+                    call min_image_vec(dr)
+                    r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
+                    if (r > pre_inw_max_r) then
+                        pre_inw_max_r = r
+                        pre_inw_max_idx = atom_index
+                    end if
                 end if
             else
                 exit
@@ -670,18 +713,26 @@ contains
             atom_index = masks%outer_mask(i)
             if (atom_index .gt. 0) then
                 a = 3*atom_index - 2
-                dr = x(a:a+2) - com
-                call min_image_vec(dr)
-                r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
-                if (r < pre_out_min_r) then
-                    pre_out_min_r = r
-                    pre_out_min_idx = atom_index
+                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                    dr = x(a:a+2) - com
+                    call min_image_vec(dr)
+                    r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
+                    if (r < pre_out_min_r) then
+                        pre_out_min_r = r
+                        pre_out_min_idx = atom_index
+                    end if
                 end if
             else
                 exit
             end if
             i = i + 1
         end do
+#ifdef MPI
+        pre_inw_max_r_glob = pre_inw_max_r
+        pre_out_min_r_glob = pre_out_min_r
+        call mpi_allreduce(pre_inw_max_r_glob, pre_inw_max_r, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+        call mpi_allreduce(pre_out_min_r_glob, pre_out_min_r, 1, MPI_DOUBLE_PRECISION, mpi_min, commsander, ierr)
+#endif
 
         ! First pass (JOSE): define boundary
         ! Mode 0: rmax from farthest INNER (solute) atom relative to COM
@@ -691,14 +742,16 @@ contains
                 do i = 1, n_inner_eff
                     atom_index = inner_eff(i)
                     a = 3*atom_index - 2
-                    dr = x(a:a+2) - com
-                    call min_image_vec(dr)
-                    r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
-                    if (r > rmax) then
-                        rmax = r
-                        j_anchor = atom_index
+                    if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                        dr = x(a:a+2) - com
+                        call min_image_vec(dr)
+                        r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
+                        if (r > rmax) then
+                            rmax = r
+                            j_anchor = atom_index
+                        end if
+                        m_tot_inner = m_tot_inner + mass(atom_index)
                     end if
-                    m_tot_inner = m_tot_inner + mass(atom_index)
                 end do
             else
                 ! No massive inner atoms: use farthest inner-solvent distance as boundary
@@ -727,7 +780,10 @@ contains
                 ! accumulate total inner mass for reaction distribution
                 do i = 1, n_inner_eff
                     atom_index = inner_eff(i)
-                    m_tot_inner = m_tot_inner + mass(atom_index)
+                    a = 3*atom_index - 2
+                    if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                        m_tot_inner = m_tot_inner + mass(atom_index)
+                    end if
                 end do
             end if
             rmax = fires_rmax_const
@@ -743,6 +799,20 @@ contains
         else
             rmax_ema = -1.0d0
         end if
+
+    rmax_local = rmax
+    j_anchor_local = j_anchor
+    anchor_candidate = 0
+    anchor_tol = 1.0d-12*max(1.0d0, abs(rmax_local))
+#ifdef MPI
+    call mpi_allreduce(rmax_local, rmax, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+    if (rmax > 0.0d0 .and. j_anchor_local > 0) then
+        if (abs(rmax - rmax_local) <= max(1.0d-12, anchor_tol)) anchor_candidate = j_anchor_local
+    end if
+    call mpi_allreduce(anchor_candidate, j_anchor, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+#else
+    j_anchor = j_anchor_local
+#endif
 
     ! Reset notice throttle if FIRES is active this step
     if (j_anchor > 0 .and. rmax >= EPS) fires_notice_printed = .false.
@@ -761,14 +831,16 @@ contains
                         atom_index = masks%inner_mask(i)
                         if (atom_index .gt. 0) then
                             a = 3*atom_index - 2
-                            dr = x(a:a+2) - com
-                            call min_image_vec(dr)
-                            r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
-                            if (r > rmax) then
-                                rmax = r
-                                j_anchor = atom_index
+                            if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                                dr = x(a:a+2) - com
+                                call min_image_vec(dr)
+                                r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
+                                if (r > rmax) then
+                                    rmax = r
+                                    j_anchor = atom_index
+                                end if
+                                m_tot_inner = m_tot_inner + mass(atom_index)
                             end if
-                            m_tot_inner = m_tot_inner + mass(atom_index)
                         else
                             exit
                         end if
@@ -785,7 +857,10 @@ contains
                         do while (i <= size(masks%inner_mask))
                             atom_index = masks%inner_mask(i)
                             if (atom_index .gt. 0) then
-                                m_tot_inner = m_tot_inner + mass(atom_index)
+                                a = 3*atom_index - 2
+                                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                                    m_tot_inner = m_tot_inner + mass(atom_index)
+                                end if
                             else
                                 exit
                             end if
@@ -804,6 +879,20 @@ contains
             end if
         end if
 
+    rmax_local = rmax
+    j_anchor_local = j_anchor
+    anchor_candidate = 0
+    anchor_tol = 1.0d-12*max(1.0d0, abs(rmax_local))
+#ifdef MPI
+    call mpi_allreduce(rmax_local, rmax, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+    if (rmax > 0.0d0 .and. j_anchor_local > 0) then
+        if (abs(rmax - rmax_local) <= max(1.0d-12, anchor_tol)) anchor_candidate = j_anchor_local
+    end if
+    call mpi_allreduce(anchor_candidate, j_anchor, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+#else
+    j_anchor = j_anchor_local
+#endif
+
         if (j_anchor <= 0 .or. rmax < EPS) then
             ! Even if FIRES is inactive, compute farthest inner-solvent distance for diagnostics
             r_inw_max = 0.0d0
@@ -812,12 +901,14 @@ contains
                 atom_index = masks%inner_solvent_mask(i)
                 if (atom_index .gt. 0) then
                     a = 3*atom_index - 2
-                    dr = x(a:a+2) - com
-                    call min_image_vec(dr)
-                    r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
-                    if (r > r_inw_max) then
-                        r_inw_max = r
-                        inw_max_idx = atom_index
+                    if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                        dr = x(a:a+2) - com
+                        call min_image_vec(dr)
+                        r = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
+                        if (r > r_inw_max) then
+                            r_inw_max = r
+                            inw_max_idx = atom_index
+                        end if
                     end if
                 else
                     exit
@@ -865,34 +956,34 @@ contains
             atom_index = masks%outer_mask(i)
             if (atom_index .gt. 0) then
                 a = 3*atom_index - 2
+                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
                     dr = x(a:a+2) - com
                     call min_image_vec(dr)
-                r2 = dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3)
-                if (r2 < rmaxm2) then
-                    r = sqrt(r2)
-                    if (fires_band_filter_enabled) then
-                        ! For OUTER (inside), keep only those within halfwidth of boundary
-                        if ((rmax - r) > fires_band_halfwidth) then
-                            i = i + 1
-                            cycle
+                    r2 = dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3)
+                    if (r2 < rmaxm2) then
+                        r = sqrt(r2)
+                        if (fires_band_filter_enabled) then
+                            ! For OUTER (inside), keep only those within halfwidth of boundary
+                            if ((rmax - r) > fires_band_halfwidth) then
+                                i = i + 1
+                                cycle
+                            end if
                         end if
-                    end if
-                    if (r < min_outer_r) then
-                        min_outer_r = r
-                        min_outer_idx = atom_index
-                    end if
-                    ui = dr / max(r, EPS)
-                    delta = r - rmax  ! negative
-                    ! Applied force on penetrating outer atom
-                    fa = -fires_k * delta * ui
-                    if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                        if (r < min_outer_r) then
+                            min_outer_r = r
+                            min_outer_idx = atom_index
+                        end if
+                        ui = dr / max(r, EPS)
+                        delta = r - rmax  ! negative
+                        ! Applied force on penetrating outer atom
+                        fa = -fires_k * delta * ui
                         f(a:a+2) = f(a:a+2) + fa
                         eacc = eacc + 0.5D0 * fires_k * (rmax - r)*(rmax - r)
+                        ! Reaction on inner COM is negative of applied forces
+                        f_react_com = f_react_com - fa
+                        f_sum_pen = f_sum_pen + fa
+                        last_n_pen = last_n_pen + 1
                     end if
-                    ! Reaction on inner COM is negative of applied forces
-                    f_react_com = f_react_com - fa
-                    f_sum_pen = f_sum_pen + fa
-                    last_n_pen = last_n_pen + 1
                 end if
             else
                 exit
@@ -906,28 +997,28 @@ contains
             atom_index = masks%inner_mask(i)
             if (atom_index .gt. 0) then
                 a = 3*atom_index - 2
+                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
                     dr = x(a:a+2) - com
                     call min_image_vec(dr)
-                r2 = dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3)
-                if (r2 > rmaxp2) then
-                    r = sqrt(r2)
-                    if (fires_band_filter_enabled) then
-                        ! For INNER (outside), keep only those within halfwidth of boundary
-                        if ((r - rmax) > fires_band_halfwidth) then
-                            i = i + 1
-                            cycle
+                    r2 = dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3)
+                    if (r2 > rmaxp2) then
+                        r = sqrt(r2)
+                        if (fires_band_filter_enabled) then
+                            ! For INNER (outside), keep only those within halfwidth of boundary
+                            if ((r - rmax) > fires_band_halfwidth) then
+                                i = i + 1
+                                cycle
+                            end if
                         end if
-                    end if
-                    ui = dr / max(r, EPS)
-                    delta = r - rmax  ! positive
-                    ! Applied force on inner (non-water) atom: pull inward
-                    fa = -fires_k * delta * ui
-                    if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                        ui = dr / max(r, EPS)
+                        delta = r - rmax  ! positive
+                        ! Applied force on inner (non-water) atom: pull inward
+                        fa = -fires_k * delta * ui
                         f(a:a+2) = f(a:a+2) + fa
                         eacc = eacc + 0.5D0 * fires_k * (r - rmax)*(r - rmax)
+                        ! Reaction applied to inner COM to conserve momentum
+                        f_react_com = f_react_com - fa
                     end if
-                    ! Reaction applied to inner COM to conserve momentum
-                    f_react_com = f_react_com - fa
                 end if
             else
                 exit
@@ -941,31 +1032,31 @@ contains
             atom_index = masks%inner_solvent_mask(i)
             if (atom_index .gt. 0) then
                 a = 3*atom_index - 2
-                dr = x(a:a+2) - com
-                call min_image_vec(dr)
-                r2 = dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3)
-                r = sqrt(r2)
-        if (r > r_inw_max) then
-            r_inw_max = r
-            inw_max_idx = atom_index
-        end if
-                if (r2 > rmaxp2) then
-                    if (fires_band_filter_enabled) then
-                        if ((r - rmax) > fires_band_halfwidth) then
-                            i = i + 1
-                            cycle
-                        end if
+                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                    dr = x(a:a+2) - com
+                    call min_image_vec(dr)
+                    r2 = dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3)
+                    r = sqrt(r2)
+                    if (r > r_inw_max) then
+                        r_inw_max = r
+                        inw_max_idx = atom_index
                     end if
-                    ui = dr / max(r, EPS)
-                    delta = r - rmax
-                    fa = -fires_k * delta * ui
-                    if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                    if (r2 > rmaxp2) then
+                        if (fires_band_filter_enabled) then
+                            if ((r - rmax) > fires_band_halfwidth) then
+                                i = i + 1
+                                cycle
+                            end if
+                        end if
+                        ui = dr / max(r, EPS)
+                        delta = r - rmax
+                        fa = -fires_k * delta * ui
                         f(a:a+2) = f(a:a+2) + fa
                         eacc = eacc + 0.5D0 * fires_k * (r - rmax)*(r - rmax)
+                        f_react_com = f_react_com - fa
+                        f_sum_inw = f_sum_inw + fa
+                        last_n_inw_out = last_n_inw_out + 1
                     end if
-                    f_react_com = f_react_com - fa
-                    f_sum_inw = f_sum_inw + fa
-                    last_n_inw_out = last_n_inw_out + 1
                 end if
             else
                 exit
@@ -974,6 +1065,12 @@ contains
         end do
 
         ! Apply the force to the INNER group mass-weighted to conserve momentum and avoid torque
+#ifdef MPI
+        m_tot_inner_glob = m_tot_inner
+        f_react_com_glob = f_react_com
+        call mpi_allreduce(m_tot_inner_glob, m_tot_inner, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+        call mpi_allreduce(f_react_com_glob, f_react_com, 3, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+#endif
         if (m_tot_inner > EPS) then
             do i = 1, n_inner_eff
                 atom_index = inner_eff(i)
