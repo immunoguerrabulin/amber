@@ -348,7 +348,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical :: mts_flag_arr(1), cache_flag_arr(1)
   logical :: mts_flag_buf(1), mts_flag_result_buf(1)
   logical :: cache_flag_buf(1), cache_flag_result_buf(1)
-  logical :: fires_enabled_any(1), early_exit_any(1)
+  logical :: fires_enabled_any(1)
   integer :: mask_flag_min, mask_flag_max, mask_flag_local, mask_flag_global
   integer :: mask_flag_buf(1), mask_flag_min_buf(1), mask_flag_max_buf(1)
 #endif
@@ -2221,19 +2221,18 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       do i3 = istart3, iend3
         fires_magnitude = fires_magnitude + f_fires_curr(i3)*f_fires_curr(i3)
       end do
-      
+
     ! JOSE MOD (MPI sync): Make the "skip MTS" decision consistent across ranks
-      early_exit_local = (fires_magnitude < 1.0d-12)
-      early_exit_global = early_exit_local
+      early_exit_local = .false.
 #ifdef MPI
       if (numtasks > 1) then
-        early_exit_any(1) = early_exit_local
-        if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce early_exit nstep=', nstep, ' sub=0'
-        call mpi_allreduce(MPI_IN_PLACE, early_exit_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
-        early_exit_global = early_exit_any(1)
-        if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,l1)') 'DBG[MTS]: exit reduce early_exit nstep=', nstep, ' sub=0 value=', early_exit_global
+        if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce fires_magnitude nstep=', nstep, ' sub=0'
+        call mpi_allreduce(MPI_IN_PLACE, fires_magnitude, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+        if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce fires_magnitude nstep=', nstep, ' sub=0 value=', fires_magnitude
       end if
 #endif
+      early_exit_global = (fires_magnitude < 1.0d-12)
+      early_exit_local = early_exit_global
       
     if (early_exit_global) then
         ! FIRES is essentially zero - just use standard integration
@@ -2363,10 +2362,12 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
             fires_magnitude = fires_magnitude + f_fires_curr(i3)*f_fires_curr(i3)
           end do
           ! JOSE MOD (MPI sync): Early-exit decision must be rank-consistent
-          early_exit_local = (fires_magnitude < 1.0d-12)
-          early_exit_global = early_exit_local
+          early_exit_local = .false.
 #ifdef MPI
           if (numtasks > 1) then
+            if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce fires_magnitude nstep=', nstep, ' sub=', sub
+            call mpi_allreduce(MPI_IN_PLACE, fires_magnitude, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+            if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce fires_magnitude nstep=', nstep, ' sub=', sub, ' value=', fires_magnitude
             maxabs = 0.0d0
             nanflag = 0
             infflag = 0
@@ -2385,12 +2386,12 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
               write(6,'(a,i7,a,i4,a,1pe12.5,2(a,i4))') 'DBG[MTS]: sentinels nstep=', nstep, ' sub=', sub, &
                 ' max|v|=', maxabs_buf(1), ' nNaN=', nanflag_buf(1), ' nInf=', infflag_buf(1)
             end if
-            if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce early_exit nstep=', nstep, ' sub=', sub
-            early_exit_any(1) = early_exit_local
-            call mpi_allreduce(MPI_IN_PLACE, early_exit_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
-            early_exit_global = early_exit_any(1)
-            if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,l1)') 'DBG[MTS]: exit reduce early_exit nstep=', nstep, ' sub=', sub, ' value=', early_exit_global
           end if
+#endif
+          early_exit_global = (fires_magnitude < 1.0d-12)
+          early_exit_local = early_exit_global
+#ifdef MPI
+          if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,l1)') 'DBG[MTS]: early-exit decision nstep=', nstep, ' sub=', sub, ' value=', early_exit_global
 #endif
           if (early_exit_global) then
             ! Complete first microstep's second half-kick (forces ~0) and Langevin
