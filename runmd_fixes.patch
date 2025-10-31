@@ -1,0 +1,66 @@
+--- runmd.F90.orig
++++ runmd.F90
+@@ -2638,8 +2638,8 @@
+       call mpi_allreduce(MPI_IN_PLACE, atomvir, 1, MPI_DOUBLE_PRECISION, &
+                          mpi_sum, commworld, ierr)
+ #  else
+-      call mpi_allreduce(centvir, mpitmp, 1, MPI_DOUBLE_PRECISION, &
+-                         mpi_sum, commworld, ierr)
++      mpitmp(1) = centvir
++      call mpi_allreduce(mpitmp, mpitmp, 1, MPI_DOUBLE_PRECISION, mpi_sum, commworld, ierr)
+       centvir = mpitmp(1)
+       tmp = 0.0
+       call mpi_allreduce(atomvir, tmp, 1, MPI_DOUBLE_PRECISION, &
+@@ -2662,9 +2662,9 @@
+                            mpi_sum, commmaster, ierr)
+ #    endif /* LES */
+ #  else
+-      call mpi_allreduce(centvir, tmp, 1, MPI_DOUBLE_PRECISION, &
+-                         mpi_sum, commworld, ierr)
+-      centvir = tmp
++      mpitmp(1) = centvir
++      call mpi_allreduce(mpitmp, mpitmp, 1, MPI_DOUBLE_PRECISION, mpi_sum, commworld, ierr)
++      centvir = mpitmp(1)
+       tmpvir = 0.0
+       call mpi_allreduce(bnd_vir, tmpvir, 9, MPI_DOUBLE_PRECISION, &
+                          mpi_sum, commworld, ierr)
+@@ -3289,8 +3289,8 @@
+       call mpi_allreduce(MPI_IN_PLACE, Ekin2_tot, 1, MPI_DOUBLE_PRECISION, &
+                          mpi_sum, commworld, ierr)
+ #  else
+-      call mpi_allreduce(Ekin2_tot, mpitmp, 1, MPI_DOUBLE_PRECISION, &
+-                         mpi_sum, commworld, ierr)
++      mpitmp(1) = Ekin2_tot
++      call mpi_allreduce(mpitmp, mpitmp, 1, MPI_DOUBLE_PRECISION, mpi_sum, commworld, ierr)
+       Ekin2_tot = mpitmp(1)
+ #  endif /* USE_MPI_IN_PLACE */
+ #endif /* MPI */
+@@ -3332,8 +3332,8 @@
+       call mpi_allreduce(MPI_IN_PLACE, Ekin2_tot, 1, MPI_DOUBLE_PRECISION, &
+                          mpi_sum, commworld, ierr)
+ #  else
+-      call mpi_allreduce(Ekin2_tot, mpitmp, 1, MPI_DOUBLE_PRECISION, &
+-                         mpi_sum, commworld, ierr)
++      mpitmp(1) = Ekin2_tot
++      call mpi_allreduce(mpitmp, mpitmp, 1, MPI_DOUBLE_PRECISION, mpi_sum, commworld, ierr)
+       Ekin2_tot = mpitmp(1)
+ #  endif /* USE_MPI_IN_PLACE */
+ #endif /* MPI */
+@@ -3616,8 +3616,9 @@
+         v_lnv = c1v * v_lnv + fln
+       end if
+ #ifdef MPI
+-      call mpi_bcast(v_lnv, 1, MPI_DOUBLE_PRECISION, 0, &
+-                   commworld, ierr)
++      mpitmp(1) = v_lnv
++      call mpi_bcast(mpitmp, 1, MPI_DOUBLE_PRECISION, 0, commworld, ierr)
++      v_lnv = mpitmp(1)
+ #endif
+       aa = exp(dt25 * v_lnv)
+       arg2 = v_lnv * dt25 * v_lnv * dt25
+@@ -5833,4 +5834,4 @@
+   600 format(i4,2x,4f12.4)
+   call trace_exit( 'runmd' )
+   return
+-end subroutine runmd
++end subroutine runmd
