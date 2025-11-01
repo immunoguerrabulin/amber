@@ -22,11 +22,11 @@ module qmmm_fires_module
 !    fires_k = (force constant for the boundary potential)
 !+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     use findmask
+    implicit none
 #ifdef MPI
 #  include "parallel.h"
   include 'mpif.h'
 #endif
-    implicit none
     private
     public :: FireMasks, calculate_fires_force, fires_force, setup_fires, fires_set_local_bounds, fires_restraint_enabled, fires_prepare_if_needed, fires_mask_signature
     ! Debug/diagnostics: last computed FIRES force components
@@ -358,7 +358,7 @@ contains
         _REAL_, intent(out) :: com(3)
         integer :: i, a, atom_index, ref_idx, aref
         _REAL_ :: msum
-        _REAL_ :: rref(3), dr(3), rimag(3)
+        _REAL_ :: rref(3), rref_local(3), dr(3), rimag(3)
 #include "../include/md.h"
 
         com = 0.0D0
@@ -431,7 +431,8 @@ contains
         end if
 #ifdef MPI
         call mpi_allreduce(have_ref_local, have_ref_global, 1, MPI_INTEGER, mpi_sum, commsander, ierr)
-        call mpi_allreduce(rref, rref, 3, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+        rref_local = rref
+        call mpi_allreduce(rref_local, rref, 3, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
 #else
         have_ref_global = have_ref_local
 #endif
