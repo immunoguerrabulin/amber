@@ -251,49 +251,39 @@ contains
 
     ! Re-evaluate FIRES masks on demand using current coordinates
     subroutine refresh_fires_masks(xcur)
-        use memory_module, only: atom_name, amber_atom_type, residue_label, residue_pointer
+        use memory_module, only: atom_name, amber_atom_type, residue_label, residue_pointer, mass
         implicit none
 #include "../include/memory.h"
 #include "../include/md.h"
-        integer :: i, counter
         _REAL_, intent(in) :: xcur(*)
+        _REAL_ :: center(3)
+        logical :: have_center
+        integer :: i, counter
         character(len=256) :: s_inner, s_inw, s_outer
         integer :: prnlev
-        _REAL_ :: center(3), ref_coord(3), vec(3)
-        integer :: count_inner
-        logical :: have_center
 
         if (fires_natom <= 0 .or. fires_nres <= 0) return
 
-    if (.not. allocated(fire_inner_mask))          allocate(fire_inner_mask(fires_natom))
+        have_center = .false.
+        center = 0.0d0
+
+        if (allocated(masks%inner_mask)) then
+            if (size(masks%inner_mask) > 0) then
+                call get_center(xcur, mass, center)
+                have_center = .true.
+            end if
+        end if
+
+        if (.not. allocated(fire_inner_mask))          allocate(fire_inner_mask(fires_natom))
         if (.not. allocated(fire_inner_solvent_mask))  allocate(fire_inner_solvent_mask(fires_natom))
         if (.not. allocated(fire_outer_mask))          allocate(fire_outer_mask(fires_natom))
-    s_inner = trim(fire_inner)
-    s_inw   = trim(fire_inner_solvent)
-    s_outer = trim(fire_outer)
-    prnlev = 0
-    call atommask(fires_natom, fires_nres, prnlev, atom_name, amber_atom_type, residue_pointer, residue_label, xcur, s_inner,          fire_inner_mask)
-    call atommask(fires_natom, fires_nres, prnlev, atom_name, amber_atom_type, residue_pointer, residue_label, xcur, s_inw,            fire_inner_solvent_mask)
-    call atommask(fires_natom, fires_nres, prnlev, atom_name, amber_atom_type, residue_pointer, residue_label, xcur, s_outer,          fire_outer_mask)
-
-        center = 0.0d0
-        count_inner = 0
-        have_center = .false.
-        do i = 1, fires_natom
-            if (fire_inner_mask(i) == 1) then
-                if (.not. have_center) then
-                    ref_coord = xcur(3*i-2:3*i)
-                    center = ref_coord
-                    have_center = .true.
-                else
-                    vec = xcur(3*i-2:3*i) - ref_coord
-                    call min_image_vec(vec)
-                    center = center + (ref_coord + vec)
-                end if
-                count_inner = count_inner + 1
-            end if
-        end do
-        if (have_center .and. count_inner > 0) center = center / count_inner
+        s_inner = trim(fire_inner)
+        s_inw   = trim(fire_inner_solvent)
+        s_outer = trim(fire_outer)
+        prnlev = 0
+        call atommask(fires_natom, fires_nres, prnlev, atom_name, amber_atom_type, residue_pointer, residue_label, xcur, s_inner,          fire_inner_mask)
+        call atommask(fires_natom, fires_nres, prnlev, atom_name, amber_atom_type, residue_pointer, residue_label, xcur, s_inw,            fire_inner_solvent_mask)
+        call atommask(fires_natom, fires_nres, prnlev, atom_name, amber_atom_type, residue_pointer, residue_label, xcur, s_outer,          fire_outer_mask)
 
         if (fires_hyst_enabled) then
             call apply_mask_hysteresis(fire_inner_mask, fire_inner_mask_prev, xcur, center, have_center)
@@ -397,7 +387,7 @@ contains
         integer :: a, i, atom_index, ref_idx, aref
         integer :: have_ref_local, have_ref_global
         _REAL_ :: msum_local, msum_global
-        _REAL_ :: rref(3), dr(3), rimag(3)
+        _REAL_ :: rref(3), rref_local(3), dr(3), rimag(3)
         _REAL_ :: center_local(3), center_global(3)
 #ifdef MPI
         integer :: ierr
@@ -547,34 +537,57 @@ contains
         integer, allocatable, intent(inout) :: mask_prev(:)
         _REAL_, intent(in) :: xcur(*), center(3)
         logical, intent(in) :: have_center
-        integer :: i
+        integer :: i, a
         _REAL_ :: dr(3), dist
-        logical :: was_in, final_in
-        integer, allocatable :: prev_snapshot(:)
+        logical :: was_in
+        integer, allocatable :: prev_snapshot(:), curr_local(:)
+#ifdef MPI
+        integer :: ierr
+#endif
+#include "../include/md.h"
 
-        if (.not. fires_hyst_enabled .or. .not. have_center) then
-            call ensure_prev_mask(mask_curr, mask_prev)
+        call ensure_prev_mask(mask_curr, mask_prev)
+
+        if (.not. have_center) then
+            mask_curr = mask_prev
+#ifdef MPI
+            call mpi_allreduce(MPI_IN_PLACE, mask_curr, size(mask_curr), MPI_INTEGER, mpi_max, commsander, ierr)
+#endif
+            mask_prev = mask_curr
             return
         end if
 
-        call ensure_prev_mask(mask_curr, mask_prev)
         allocate(prev_snapshot(size(mask_prev)))
         prev_snapshot = mask_prev
 
+        allocate(curr_local(size(mask_curr)))
+        curr_local = mask_curr
+
         do i = 1, size(mask_curr)
-            was_in = (prev_snapshot(i) == 1)
-            final_in = (mask_curr(i) == 1)
-            if (.not. final_in) then
-                dr = xcur(3*i-2:3*i) - center
-                call min_image_vec(dr)
-                dist = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
-                if (fires_in_band(dist, was_in)) final_in = .true.
+            if (curr_local(i) == 0) then
+                was_in = (prev_snapshot(i) == 1)
+                a = 3*i - 2
+                if (a >= g_loc_istart3 .and. a+2 <= g_loc_iend3) then
+                    dr = xcur(a:a+2) - center
+                    call min_image_vec(dr)
+                    dist = sqrt(dr(1)*dr(1) + dr(2)*dr(2) + dr(3)*dr(3))
+                    if (fires_in_band(dist, was_in)) curr_local(i) = 1
+                else
+                    if (was_in) curr_local(i) = 1
+                end if
             end if
-            mask_curr(i) = merge(1, 0, final_in)
         end do
 
+#ifdef MPI
+        call mpi_allreduce(curr_local, mask_curr, size(mask_curr), MPI_INTEGER, mpi_max, commsander, ierr)
+#else
+        mask_curr = curr_local
+#endif
+
         mask_prev = mask_curr
+
         deallocate(prev_snapshot)
+        deallocate(curr_local)
     end subroutine apply_mask_hysteresis
 
     subroutine calculate_fires_force(x, mass, natom, f, efires)
