@@ -234,8 +234,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_ :: ener_kin_tot_buf(1), totener_kin_tot_buf(1)
   integer :: fires_buf(1), mts_n_buf(1)
   _REAL_ :: mts_fires_buf(1), fires_k_buf(1), fires_band_halfwidth_buf(1)
-  logical :: fires_band_filter_enabled_buf(1), fires_debug_buf(1), fires_disable_cache_buf(1)
-  logical :: fires_debug_glob(1), fires_disable_cache_glob(1)
+  logical :: fires_band_filter_enabled_buf(1)
 #else
   ! mdloop and REM is always 0 in serial
   integer, parameter :: mdloop = 0, rem = 0, remd_types(1) = 0, replica_indexes(1) = 0
@@ -345,12 +344,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical :: fires_restraint_enabled_local, fires_restraint_enabled_global
   integer :: mts_n_local, mts_n_min, mts_n_max
 #ifdef MPI
-  logical :: mts_flag_arr(1), cache_flag_arr(1)
-  logical :: mts_flag_buf(1), mts_flag_result_buf(1)
-  logical :: cache_flag_buf(1), cache_flag_result_buf(1)
-  logical :: fires_enabled_any(1)
   integer :: mask_flag_min, mask_flag_max, mask_flag_local, mask_flag_global
   integer :: mask_flag_buf(1), mask_flag_min_buf(1), mask_flag_max_buf(1)
+  integer :: mpi_flag_buf(1)
 #endif
   ! Debug controls for FIRES/MTS. Enable via FIRES_DEBUG=1 env var.
   logical :: fires_debug = .false.
@@ -946,12 +942,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     call mpi_bcast(fire_inner, len(fire_inner), MPI_CHARACTER, 0, commsander, ierr)
     call mpi_bcast(fire_inner_solvent, len(fire_inner_solvent), MPI_CHARACTER, 0, commsander, ierr)
     call mpi_bcast(fire_outer, len(fire_outer), MPI_CHARACTER, 0, commsander, ierr)
-    fires_debug_buf(1) = fires_debug
-    fires_disable_cache_buf(1) = fires_disable_cache
-    call mpi_allreduce(fires_debug_buf, fires_debug_glob, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
-    call mpi_allreduce(fires_disable_cache_buf, fires_disable_cache_glob, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
-    fires_debug = fires_debug_glob(1)
-    fires_disable_cache = fires_disable_cache_glob(1)
+    mpi_flag_buf(1) = 0
+    if (fires_debug) mpi_flag_buf(1) = 1
+    call mpi_allreduce(mpi_flag_buf, mpi_flag_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+    fires_debug = (mpi_flag_buf(1) == 1)
+    mpi_flag_buf(1) = 0
+    if (fires_disable_cache) mpi_flag_buf(1) = 1
+    call mpi_allreduce(mpi_flag_buf, mpi_flag_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+    fires_disable_cache = (mpi_flag_buf(1) == 1)
   end if
 #endif
 
@@ -2058,16 +2056,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       counts_prev   = counts
       have_prev_sig = .true.
     end if
-#ifdef MPI
-    fires_enabled_any(1) = .false.
-#endif
     fires_restraint_enabled_local = fires_restraint_enabled()
     fires_restraint_enabled_global = fires_restraint_enabled_local
 #ifdef MPI
     if (numtasks > 1) then
-      fires_enabled_any(1) = fires_restraint_enabled_local
-      call mpi_allreduce(MPI_IN_PLACE, fires_enabled_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
-      fires_restraint_enabled_global = fires_enabled_any(1)
+      mpi_flag_buf(1) = 0
+      if (fires_restraint_enabled_local) mpi_flag_buf(1) = 1
+      call mpi_allreduce(mpi_flag_buf, mpi_flag_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+      fires_restraint_enabled_global = (mpi_flag_buf(1) == 1)
       mask_flag_local = 0
       if (fires_restraint_enabled_local) mask_flag_local = 1
       mask_flag_buf(1) = mask_flag_local
@@ -2118,11 +2114,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         if (master) write(6,'(a)') 'FIRES ERROR: MTS availability differs across MPI ranks; check FIRES masks.'
         call mexit(6, 1)
       end if
-      mts_flag_arr(1) = do_fires_mts
-      mts_flag_buf(1) = mts_flag_arr(1)
-      call mpi_allreduce(mts_flag_buf, mts_flag_result_buf, 1, MPI_LOGICAL, MPI_LAND, commsander, ierr)
-      mts_flag_arr(1) = mts_flag_result_buf(1)
-      do_fires_mts = mts_flag_arr(1)
+      mpi_flag_buf(1) = 0
+      if (do_fires_mts) mpi_flag_buf(1) = 1
+      call mpi_allreduce(mpi_flag_buf, mpi_flag_buf, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+      do_fires_mts = (mpi_flag_buf(1) == 1)
     end if
 #endif
 
@@ -2131,11 +2126,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
 #ifdef MPI
     if (numtasks > 1) then
-      cache_flag_arr(1) = use_cached_slow_force
-      cache_flag_buf(1) = cache_flag_arr(1)
-      call mpi_allreduce(cache_flag_buf, cache_flag_result_buf, 1, MPI_LOGICAL, MPI_LAND, commsander, ierr)
-      cache_flag_arr(1) = cache_flag_result_buf(1)
-      use_cached_slow_force = cache_flag_arr(1)
+      mpi_flag_buf(1) = 0
+      if (use_cached_slow_force) mpi_flag_buf(1) = 1
+      call mpi_allreduce(mpi_flag_buf, mpi_flag_buf, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+      use_cached_slow_force = (mpi_flag_buf(1) == 1)
       if (.not. use_cached_slow_force) f_slow_cache_valid = .false.
       if (.not. use_cached_slow_force .and. allocated(f_slow_cache)) f_slow_cache = 0.0d0
     end if
@@ -2236,7 +2230,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       
     if (early_exit_global) then
         ! FIRES is essentially zero - just use standard integration
-        skip_force_refresh = .true.
+        skip_force_refresh = .false.
         f_slow_cache_valid = .false.
         
         ! Record FIRES restraint energy so reported totals include subcycled work
@@ -2253,10 +2247,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         deallocate(f_fires_curr)
 
          ! Refresh slow-force energies so totals reflect final coordinates
-         if (.not. skip_force_refresh) then
-            call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), &
-                       xx(l97), xx(l98), xx(l99), qsetup, do_list_update, nstep)
-         end if
+         call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), &
+                    xx(l97), xx(l98), xx(l99), qsetup, do_list_update, nstep)
 
          ener%pot%constraint = ener%pot%constraint + efires_report
          ener%pot%tot        = ener%pot%tot        + efires_report
@@ -2868,9 +2860,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       call mpi_allreduce(MPI_IN_PLACE, e14vir, 9, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
 #    ifndef LES
-      if (master) &
+      if (commmaster /= MPI_COMM_NULL) then
         call mpi_allreduce(MPI_IN_PLACE, atvir, 9, MPI_DOUBLE_PRECISION, &
                            mpi_sum, commmaster, ierr)
+      end if
 #    endif /* LES */
 #  else
       mpitmp(1) = centvir
@@ -2882,7 +2875,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
                          mpi_sum, commworld, ierr)
       bnd_vir = tmpvir
 #    ifndef LES
-      if (master) then
+      if (commmaster /= MPI_COMM_NULL) then
         tmpvir = 0.0
         call mpi_allreduce(e14vir, tmpvir, 9, MPI_DOUBLE_PRECISION, &
                            mpi_sum, commmaster, ierr)
@@ -4426,8 +4419,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
     ! In dual-topology this is done within softcore.f
     if (ifsc .ne. 1) then
-      if (master) &
+      if (commmaster /= MPI_COMM_NULL) then
         call mpi_bcast(x, nr3, MPI_DOUBLE_PRECISION, 0, commmaster, ierr)
+      end if
     else
       if (master) then
 
