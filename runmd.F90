@@ -237,7 +237,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_ :: ener_kin_tot_buf(1), totener_kin_tot_buf(1)
   integer :: fires_buf(1), mts_n_buf(1)
   _REAL_ :: mts_fires_buf(1), fires_k_buf(1), fires_band_halfwidth_buf(1)
-  logical :: fires_band_filter_enabled_buf(1)
+  logical :: saved_fires_band_filter_enabled, fires_band_filter_enabled_buf(1)
 #else
   ! mdloop and REM is always 0 in serial
   integer, parameter :: mdloop = 0, rem = 0, remd_types(1) = 0, replica_indexes(1) = 0
@@ -2216,6 +2216,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ! Allow MTS even when Langevin (gammai>0) or SHAKE (ntc>1) are active; handle them inside the subcycling loop.
   if (do_fires_mts) then
 
+      saved_fires_band_filter_enabled = fires_band_filter_enabled
       efires_report = 0.0d0
 
       call timer_start(TIME_VERLET)
@@ -2280,6 +2281,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       
     if (early_exit_global) then
         ! FIRES is essentially zero - just use standard integration
+        fires_band_filter_enabled = saved_fires_band_filter_enabled
         skip_force_refresh = .false.
         f_slow_cache_valid = .false.
         if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
@@ -2586,8 +2588,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
          end do
          if (fires_debug .and. master) write(6,'(a,i7)') 'DBG[MTS]: microsteps complete nstep=', nstep
 
-        ! Reset band filter at the end of the MTS block so it does not persist
-        fires_band_filter_enabled = .false.
+        ! Restore FIRES band filter state after MTS subcycling completes
+        fires_band_filter_enabled = saved_fires_band_filter_enabled
         
       ! Recompute the slow forces at x(t+dt) (FIRES excluded when mts_n>1)
       call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), &
