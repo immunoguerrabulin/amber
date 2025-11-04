@@ -977,7 +977,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       call mpi_allreduce(counts, counts_max, 3, MPI_INTEGER, mpi_max, commsander, ierr)
       if (any(sig_min /= sig_max) .or. any(counts_min /= counts_max)) then
         if (master) then
-          write(6,'(a)') 'FIRES ERROR: Mask mismatch detected across MPI ranks.'
+          write(6,'(a)') 'FIRES ERROR: Mask mismatch detected across MPI ranks after synchronization.'
           write(6,'(a,3i10)') 'FIRES local counts: ', counts
         end if
         call mexit(6, 1)

@@ -122,6 +122,10 @@ contains
     integer :: num_atoms, i, inner_count, outer_count,counter, n_overlap
         character(len=256) :: s_inner, s_inw, s_outer
         integer :: prnlev
+#ifdef MPI
+        integer :: ierr
+        integer :: mask_sizes(3)
+#endif
         
         !JOSE MOD: if already initialized, skip to avoid re-allocation crash
         if (fires_initialized) then
@@ -180,6 +184,56 @@ contains
                 counter = counter + 1
             end if
         end do
+
+#ifdef MPI
+        if (numtasks > 1) then
+            call mpi_bcast(fire_inner_mask, natom_in, MPI_INTEGER, 0, commsander, ierr)
+            call mpi_bcast(fire_inner_solvent_mask, natom_in, MPI_INTEGER, 0, commsander, ierr)
+            call mpi_bcast(fire_outer_mask, natom_in, MPI_INTEGER, 0, commsander, ierr)
+
+            mask_sizes(1) = size(masks%inner_mask)
+            mask_sizes(2) = size(masks%inner_solvent_mask)
+            mask_sizes(3) = size(masks%outer_mask)
+            call mpi_bcast(mask_sizes, 3, MPI_INTEGER, 0, commsander, ierr)
+
+            if (allocated(masks%inner_mask)) then
+                if (size(masks%inner_mask) /= mask_sizes(1)) then
+                    deallocate(masks%inner_mask)
+                    allocate(masks%inner_mask(mask_sizes(1)))
+                end if
+            else
+                allocate(masks%inner_mask(mask_sizes(1)))
+            end if
+
+            if (allocated(masks%inner_solvent_mask)) then
+                if (size(masks%inner_solvent_mask) /= mask_sizes(2)) then
+                    deallocate(masks%inner_solvent_mask)
+                    allocate(masks%inner_solvent_mask(mask_sizes(2)))
+                end if
+            else
+                allocate(masks%inner_solvent_mask(mask_sizes(2)))
+            end if
+
+            if (allocated(masks%outer_mask)) then
+                if (size(masks%outer_mask) /= mask_sizes(3)) then
+                    deallocate(masks%outer_mask)
+                    allocate(masks%outer_mask(mask_sizes(3)))
+                end if
+            else
+                allocate(masks%outer_mask(mask_sizes(3)))
+            end if
+
+            if (mask_sizes(1) > 0) then
+                call mpi_bcast(masks%inner_mask, mask_sizes(1), MPI_INTEGER, 0, commsander, ierr)
+            end if
+            if (mask_sizes(2) > 0) then
+                call mpi_bcast(masks%inner_solvent_mask, mask_sizes(2), MPI_INTEGER, 0, commsander, ierr)
+            end if
+            if (mask_sizes(3) > 0) then
+                call mpi_bcast(masks%outer_mask, mask_sizes(3), MPI_INTEGER, 0, commsander, ierr)
+            end if
+        end if
+#endif
         write(6,'(a)')    'FIRES: Using masks:'
         write(6,'(a,1x,a)') '  fire_inner         =', trim(s_inner)
         write(6,'(a,1x,a)') '  fire_inner_solvent =', trim(s_inw)
@@ -236,13 +290,62 @@ contains
                     counter = counter + 1
                 end if
             end do
-            counter=1
-            do i = 1, natom_in
-                if (fire_outer_mask(i) == 1) then
-                    masks%outer_mask(counter) = i
-                    counter = counter + 1
+        counter=1
+        do i = 1, natom_in
+            if (fire_outer_mask(i) == 1) then
+                masks%outer_mask(counter) = i
+                counter = counter + 1
+            end if
+        end do
+#ifdef MPI
+        if (numtasks > 1) then
+            call mpi_bcast(fire_inner_mask, natom_in, MPI_INTEGER, 0, commsander, ierr)
+            call mpi_bcast(fire_inner_solvent_mask, natom_in, MPI_INTEGER, 0, commsander, ierr)
+            call mpi_bcast(fire_outer_mask, natom_in, MPI_INTEGER, 0, commsander, ierr)
+
+            mask_sizes(1) = size(masks%inner_mask)
+            mask_sizes(2) = size(masks%inner_solvent_mask)
+            mask_sizes(3) = size(masks%outer_mask)
+            call mpi_bcast(mask_sizes, 3, MPI_INTEGER, 0, commsander, ierr)
+
+            if (allocated(masks%inner_mask)) then
+                if (size(masks%inner_mask) /= mask_sizes(1)) then
+                    deallocate(masks%inner_mask)
+                    allocate(masks%inner_mask(mask_sizes(1)))
                 end if
-            end do
+            else
+                allocate(masks%inner_mask(mask_sizes(1)))
+            end if
+
+            if (allocated(masks%inner_solvent_mask)) then
+                if (size(masks%inner_solvent_mask) /= mask_sizes(2)) then
+                    deallocate(masks%inner_solvent_mask)
+                    allocate(masks%inner_solvent_mask(mask_sizes(2)))
+                end if
+            else
+                allocate(masks%inner_solvent_mask(mask_sizes(2)))
+            end if
+
+            if (allocated(masks%outer_mask)) then
+                if (size(masks%outer_mask) /= mask_sizes(3)) then
+                    deallocate(masks%outer_mask)
+                    allocate(masks%outer_mask(mask_sizes(3)))
+                end if
+            else
+                allocate(masks%outer_mask(mask_sizes(3)))
+            end if
+
+            if (mask_sizes(1) > 0) then
+                call mpi_bcast(masks%inner_mask, mask_sizes(1), MPI_INTEGER, 0, commsander, ierr)
+            end if
+            if (mask_sizes(2) > 0) then
+                call mpi_bcast(masks%inner_solvent_mask, mask_sizes(2), MPI_INTEGER, 0, commsander, ierr)
+            end if
+            if (mask_sizes(3) > 0) then
+                call mpi_bcast(masks%outer_mask, mask_sizes(3), MPI_INTEGER, 0, commsander, ierr)
+            end if
+        end if
+#endif
         end if
 
     call ensure_prev_mask(fire_inner_mask, fire_inner_mask_prev)
@@ -265,6 +368,10 @@ contains
         integer :: i, counter
         character(len=256) :: s_inner, s_inw, s_outer
         integer :: prnlev
+#ifdef MPI
+        integer :: ierr
+        integer :: mask_sizes(3)
+#endif
 
         if (fires_static_mask) return
 
@@ -327,6 +434,55 @@ contains
                 counter = counter + 1
             end if
         end do
+#ifdef MPI
+        if (numtasks > 1) then
+            call mpi_bcast(fire_inner_mask, fires_natom, MPI_INTEGER, 0, commsander, ierr)
+            call mpi_bcast(fire_inner_solvent_mask, fires_natom, MPI_INTEGER, 0, commsander, ierr)
+            call mpi_bcast(fire_outer_mask, fires_natom, MPI_INTEGER, 0, commsander, ierr)
+
+            mask_sizes(1) = size(masks%inner_mask)
+            mask_sizes(2) = size(masks%inner_solvent_mask)
+            mask_sizes(3) = size(masks%outer_mask)
+            call mpi_bcast(mask_sizes, 3, MPI_INTEGER, 0, commsander, ierr)
+
+            if (allocated(masks%inner_mask)) then
+                if (size(masks%inner_mask) /= mask_sizes(1)) then
+                    deallocate(masks%inner_mask)
+                    allocate(masks%inner_mask(mask_sizes(1)))
+                end if
+            else
+                allocate(masks%inner_mask(mask_sizes(1)))
+            end if
+
+            if (allocated(masks%inner_solvent_mask)) then
+                if (size(masks%inner_solvent_mask) /= mask_sizes(2)) then
+                    deallocate(masks%inner_solvent_mask)
+                    allocate(masks%inner_solvent_mask(mask_sizes(2)))
+                end if
+            else
+                allocate(masks%inner_solvent_mask(mask_sizes(2)))
+            end if
+
+            if (allocated(masks%outer_mask)) then
+                if (size(masks%outer_mask) /= mask_sizes(3)) then
+                    deallocate(masks%outer_mask)
+                    allocate(masks%outer_mask(mask_sizes(3)))
+                end if
+            else
+                allocate(masks%outer_mask(mask_sizes(3)))
+            end if
+
+            if (mask_sizes(1) > 0) then
+                call mpi_bcast(masks%inner_mask, mask_sizes(1), MPI_INTEGER, 0, commsander, ierr)
+            end if
+            if (mask_sizes(2) > 0) then
+                call mpi_bcast(masks%inner_solvent_mask, mask_sizes(2), MPI_INTEGER, 0, commsander, ierr)
+            end if
+            if (mask_sizes(3) > 0) then
+                call mpi_bcast(masks%outer_mask, mask_sizes(3), MPI_INTEGER, 0, commsander, ierr)
+            end if
+        end if
+#endif
         write(6,'(a)') 'FIRES: Refreshed masks using current coordinates.'
         write(6,'(a,i0)') 'FIRES: Inner region size: ', size(masks%inner_mask)
         write(6,'(a,i0)') 'FIRES: Inner solvent size: ', size(masks%inner_solvent_mask)
