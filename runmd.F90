@@ -73,6 +73,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   use nose_hoover_module, only: thermo_lnv, x_lnv, x_lnv_old, v_lnv, &
                                 f_lnv_p, f_lnv_v, c2_lnv, mass_lnv, &
                                 Thermostat_init
+#ifdef MPI
+  use mpi
+#endif
 #ifdef RISMSANDER
   use sander_rism_interface, only: rismprm, RISM_NONE, RISM_FULL, &
                                    RISM_INTERP, rism_calc_type, &
@@ -181,7 +184,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
   use qmmm_fires_module, only: fires, setup_fires, fires_force, fires_set_local_bounds, mts_fires, mts_n, &
        fires_k, fire_inner, fire_inner_solvent, fire_outer, &
-       fires_in_force, fires_prepare_if_needed, fires_restraint_enabled, &
+       fires_in_force, fires_prepare_if_needed, fires_restraint_enabled, fires_set_step, &
+       fires_static_mask, fires_freeze_on_nstep, &
         last_f_pot, last_f_inner_water, last_f_pen_water, last_n_pen, last_n_inw_out, &
        last_rmax, last_anchor_idx, last_rmax_inw, last_inw_max_idx, last_pen_atom_idx, &
        last_pen_r, last_pen_depth, fires_mask_signature  !JOSE MOD (FIRES + MTS)
@@ -222,7 +226,6 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   character(len=4) ih(*)
 #ifdef MPI
 #  include "parallel.h"
-  include 'mpif.h'
   _REAL_ mpitmp(8) !Use for temporary packing of mpi messages.
   _REAL_ mpitmp_recv(8)
   integer ist(MPI_STATUS_SIZE), partner
@@ -341,11 +344,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical skip_outer_shake
   logical skip_standard_position_update
   logical do_fires_mts
+  logical :: reuse_intent_local, reuse_for_all
+  logical :: part_changed_local, part_changed_any
   logical :: fires_restraint_enabled_local, fires_restraint_enabled_global
-  integer :: mts_n_local, mts_n_min, mts_n_max
+  integer :: mts_n_local
 #ifdef MPI
-  integer :: mask_flag_min, mask_flag_max, mask_flag_local, mask_flag_global
-  integer :: mask_flag_buf(1), mask_flag_min_buf(1), mask_flag_max_buf(1)
+  integer :: mts_n_min(1), mts_n_max(1)
+  integer :: mask_flag_local(1), mask_flag_global(1)
+  integer :: mask_flag_min(1), mask_flag_max(1)
   integer :: mpi_flag_buf(1)
 #endif
   ! Debug controls for FIRES/MTS. Enable via FIRES_DEBUG=1 env var.
@@ -354,6 +360,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical :: fires_disable_cache = .false.
   character(len=16) :: fires_disable_cache_env
   logical, save :: f_slow_cache_valid = .false.
+  integer, save :: istart3_prev = -1, iend3_prev = -1
   integer(int64), save :: sig_prev(3) = 0_int64
   integer,        save :: counts_prev(3) = (/ -1, -1, -1 /)
   logical,        save :: have_prev_sig = .false.
@@ -369,6 +376,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_ :: maxabs, maxabs_buf(1)
   integer :: nanflag, infflag
   integer :: nanflag_buf(1), infflag_buf(1)
+#ifdef MPI
+  _REAL_ :: fires_magnitude_buf(1)
+  _REAL_ :: efires_tmp_buf(1)
+#endif
 
 #ifdef MPI
   type(state_rec) :: ecopy
@@ -2042,6 +2053,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
 !------------------------------------------------------------------------------
     ! Determine whether we can reuse cached slow forces from the previous macro step
+    call fires_set_step(nstep)
     call fires_prepare_if_needed(x, amass, natom)
 
     ! Always track FIRES mask signature; drop cached slow force if it changes.
@@ -2049,7 +2061,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       call fires_mask_signature(sig_local(1), sig_local(2), sig_local(3), counts(1), counts(2), counts(3))
       if (have_prev_sig) then
         if (any(sig_local /= sig_prev) .or. any(counts /= counts_prev)) then
-          f_slow_cache_valid = .false.
+          if (fires_static_mask) then
+            if (master) write(6,'(a,i0,a,i0)') 'FIRES ERROR: Mask changed after freeze. nstep=', nstep, &
+              & ', freeze_on=', fires_freeze_on_nstep
+            call mexit(6, 1)
+          else
+            f_slow_cache_valid = .false.
+            if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
+          end if
         end if
       end if
       sig_prev      = sig_local
@@ -2064,20 +2083,21 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       if (fires_restraint_enabled_local) mpi_flag_buf(1) = 1
       call mpi_allreduce(MPI_IN_PLACE, mpi_flag_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
       fires_restraint_enabled_global = (mpi_flag_buf(1) == 1)
-      mask_flag_local = 0
-      if (fires_restraint_enabled_local) mask_flag_local = 1
-      mask_flag_buf(1) = mask_flag_local
-      call mpi_allreduce(mask_flag_buf, mask_flag_min_buf, 1, MPI_INTEGER, mpi_min, commsander, ierr)
-      call mpi_allreduce(mask_flag_buf, mask_flag_max_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
-      mask_flag_global = 0
-      if (fires_restraint_enabled_global) mask_flag_global = 1
+      mask_flag_local(1) = 0
+      if (fires_restraint_enabled_local) mask_flag_local(1) = 1
+      mask_flag_min(1) = mask_flag_local(1)
+      mask_flag_max(1) = mask_flag_local(1)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+      mask_flag_global(1) = 0
+      if (fires_restraint_enabled_global) mask_flag_global(1) = 1
       if (fires_debug .and. master) then
         write(6,'(a,i7,2(a,i2),a,i2)') 'DBG[FIRESTEP]: nstep=', nstep, ' fires_restraint_enabled min/max=', &
-          mask_flag_min_buf(1), '/', mask_flag_max_buf(1), ' global=', mask_flag_global
+          mask_flag_min(1), '/', mask_flag_max(1), ' global=', mask_flag_global(1)
       end if
-      if (mask_flag_min_buf(1) /= mask_flag_max_buf(1) .and. master) then
+      if (mask_flag_min(1) /= mask_flag_max(1) .and. master) then
         write(6,'(a,i7,2(a,i2))') 'FIRES WARN: enablement differed across ranks; promoting global enable via OR. nstep=', &
-          nstep, ' min/max=', mask_flag_min_buf(1), '/', mask_flag_max_buf(1)
+          nstep, ' min/max=', mask_flag_min(1), '/', mask_flag_max(1)
       end if
       if (fires_debug .and. fires == 1) then
         call fires_mask_signature(sig_local(1), sig_local(2), sig_local(3), counts(1), counts(2), counts(3))
@@ -2102,15 +2122,13 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     do_fires_mts = (fires_restraint_enabled_global .and. mts_n > 1 .and. mts_fires > 0.0d0 .and. ipimd == 0)
 #ifdef MPI
     if (numtasks > 1) then
-      mask_flag_local = 0
-      if (do_fires_mts) mask_flag_local = 1
-      mask_flag_buf(1) = mask_flag_local
-      call mpi_allreduce(mask_flag_buf, mask_flag_min_buf, 1, MPI_INTEGER, mpi_min, commsander, ierr)
-      mask_flag_min = mask_flag_min_buf(1)
-      mask_flag_buf(1) = mask_flag_local
-      call mpi_allreduce(mask_flag_buf, mask_flag_max_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
-      mask_flag_max = mask_flag_max_buf(1)
-      if (mask_flag_min /= mask_flag_max) then
+      mask_flag_local(1) = 0
+      if (do_fires_mts) mask_flag_local(1) = 1
+      mask_flag_min(1) = mask_flag_local(1)
+      mask_flag_max(1) = mask_flag_local(1)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+      if (mask_flag_min(1) /= mask_flag_max(1)) then
         if (master) write(6,'(a)') 'FIRES ERROR: MTS availability differs across MPI ranks; check FIRES masks.'
         call mexit(6, 1)
       end if
@@ -2121,39 +2139,69 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     end if
 #endif
 
-    use_cached_slow_force = do_fires_mts .and. f_slow_cache_valid
-    if (fires_disable_cache) use_cached_slow_force = .false.
+    ! Invalidate cache if the local partition bounds changed
+    part_changed_local = .false.
+    if (istart3_prev /= -1) then
+      if (istart3 /= istart3_prev .or. iend3 /= iend3_prev) then
+        f_slow_cache_valid = .false.
+        part_changed_local = .true.
+      end if
+    end if
+    istart3_prev = istart3
+    iend3_prev   = iend3
 
+    if (fires_disable_cache) f_slow_cache_valid = .false.
+
+    part_changed_any = part_changed_local
 #ifdef MPI
     if (numtasks > 1) then
-      mpi_flag_buf(1) = 0
-      if (use_cached_slow_force) mpi_flag_buf(1) = 1
-      call mpi_allreduce(MPI_IN_PLACE, mpi_flag_buf, 1, MPI_INTEGER, mpi_min, commsander, ierr)
-      use_cached_slow_force = (mpi_flag_buf(1) == 1)
-      if (.not. use_cached_slow_force) f_slow_cache_valid = .false.
-      if (.not. use_cached_slow_force .and. allocated(f_slow_cache)) f_slow_cache = 0.0d0
+      call MPI_Allreduce(part_changed_local, part_changed_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
+    end if
+#endif
+    if (part_changed_any) then
+      f_slow_cache_valid = .false.
+      if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
+    end if
+
+    reuse_intent_local = do_fires_mts .and. f_slow_cache_valid
+    reuse_for_all = reuse_intent_local
+#ifdef MPI
+    if (numtasks > 1) then
+      call MPI_Allreduce(reuse_intent_local, reuse_for_all, 1, MPI_LOGICAL, MPI_LAND, commsander, ierr)
     end if
 #endif
 
 #ifdef MPI
     if (fires_debug .and. master) then
-      write(6,'(a,i7,2(a,l1),a,l1,a,i4,a,1pe12.5)') 'DBG[STEP]: nstep=', nstep, &
-        ' do_fires_mts=', do_fires_mts, ' use_cached_slow_force=', use_cached_slow_force, &
-        ' f_slow_cache_valid=', f_slow_cache_valid, ' mts_n=', mts_n, ' dtx_fast=', dtx_fast
+      write(6,'(a,i7,3(a,l1),a,l1,a,i4,a,1pe12.5)') 'DBG[STEP]: nstep=', nstep, &
+        ' do_fires_mts=', do_fires_mts, ' reuse_intent_local=', reuse_intent_local, &
+        ' reuse_for_all=', reuse_for_all, ' f_slow_cache_valid=', f_slow_cache_valid, &
+        ' mts_n=', mts_n, ' dtx_fast=', dtx_fast
     end if
 #endif
 
-    if (.not. do_fires_mts) then
-      f_slow_cache_valid = .false.
-      if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
-    end if
+    use_cached_slow_force = reuse_for_all
 
-    ! This(!) is where the force() routine mainly gets called:
+    ! Always invoke force(); optionally skip slow terms and add cached result
+    call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), xx(l97), &
+               xx(l98), xx(l99), qsetup, do_list_update, nstep)
+
     if (use_cached_slow_force) then
-      f(1:nr3) = f_slow_cache(1:nr3)
+      if (allocated(f_slow_cache)) then
+        f(1:nr3) = f_slow_cache(1:nr3)
+      end if
     else
-      call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), xx(l97), &
-                 xx(l98), xx(l99), qsetup, do_list_update,nstep)
+      if (.not. allocated(f_slow_cache)) then
+        allocate(f_slow_cache(nr3))
+        f_slow_cache = 0.0d0
+      end if
+      if (do_fires_mts) then
+        f_slow_cache(1:nr3) = f(1:nr3)
+        f_slow_cache_valid  = .true.
+      else
+        f_slow_cache_valid = .false.
+        f_slow_cache = 0.0d0
+      end if
     end if
 
 !---------- BEGIN FIRES MTS ---------------------------------------------------
@@ -2173,17 +2221,17 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       call timer_start(TIME_VERLET)
 
       mts_n_local = mts_n
-      mts_n_min = mts_n_local
-      mts_n_max = mts_n_local
 #ifdef MPI
+      mts_n_min(1) = mts_n_local
+      mts_n_max(1) = mts_n_local
       if (numtasks > 1) then
         call mpi_allreduce(MPI_IN_PLACE, mts_n_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
         call mpi_allreduce(MPI_IN_PLACE, mts_n_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
-        if (mts_n_min .ne. mts_n_max) then
-          if (master) write(6,'(a,i8,a,i8)') 'FIRES ERROR: mts_n diverged across ranks: ', mts_n_min, ' vs ', mts_n_max
+        if (mts_n_min(1) .ne. mts_n_max(1)) then
+          if (master) write(6,'(a,i8,a,i8)') 'FIRES ERROR: mts_n diverged across ranks: ', mts_n_min(1), ' vs ', mts_n_max(1)
           call mexit(6, 1)
         end if
-        mts_n = mts_n_min
+        mts_n = mts_n_min(1)
       else
         mts_n = mts_n_local
       end if
@@ -2221,7 +2269,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #ifdef MPI
       if (numtasks > 1) then
         if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce fires_magnitude nstep=', nstep, ' sub=0'
-        call mpi_allreduce(MPI_IN_PLACE, fires_magnitude, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+        fires_magnitude_buf(1) = fires_magnitude
+        call mpi_allreduce(MPI_IN_PLACE, fires_magnitude_buf, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+        fires_magnitude = fires_magnitude_buf(1)
         if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce fires_magnitude nstep=', nstep, ' sub=0 value=', fires_magnitude
       end if
 #endif
@@ -2232,12 +2282,15 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         ! FIRES is essentially zero - just use standard integration
         skip_force_refresh = .false.
         f_slow_cache_valid = .false.
+        if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
         
         ! Record FIRES restraint energy so reported totals include subcycled work
 #ifdef MPI
         if (numtasks > 1) then
            if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce efires_tmp nstep=', nstep, ' sub=0'
-           call mpi_allreduce(MPI_IN_PLACE, efires_tmp, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+           efires_tmp_buf(1) = efires_tmp
+           call mpi_allreduce(MPI_IN_PLACE, efires_tmp_buf, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+           efires_tmp = efires_tmp_buf(1)
            if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce efires_tmp nstep=', nstep, ' sub=0 value=', efires_tmp
         end if
 #endif
@@ -2358,7 +2411,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #ifdef MPI
           if (numtasks > 1) then
             if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce fires_magnitude nstep=', nstep, ' sub=', sub
-            call mpi_allreduce(MPI_IN_PLACE, fires_magnitude, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+            fires_magnitude_buf(1) = fires_magnitude
+            call mpi_allreduce(MPI_IN_PLACE, fires_magnitude_buf, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+            fires_magnitude = fires_magnitude_buf(1)
             if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce fires_magnitude nstep=', nstep, ' sub=', sub, ' value=', fires_magnitude
             maxabs = 0.0d0
             nanflag = 0
@@ -2537,6 +2592,11 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       ! Recompute the slow forces at x(t+dt) (FIRES excluded when mts_n>1)
       call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), &
                  xx(l97), xx(l98), xx(l99), qsetup, do_list_update, nstep)
+      if (.not. allocated(f_slow_cache)) then
+        allocate(f_slow_cache(nr3))
+      end if
+      f_slow_cache(1:nr3) = f(1:nr3)
+      f_slow_cache_valid  = .true.
 
       ! Closing slow half-kick using the refreshed slow force
       i3 = 3*(istart - 1)
@@ -2552,7 +2612,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #ifdef MPI
       if (numtasks > 1) then
          if (fires_debug .and. master) write(6,'(a,i7)') 'DBG[MTS]: entering reduce efires_tmp (final) nstep=', nstep
-         call mpi_allreduce(MPI_IN_PLACE, efires_tmp, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+         efires_tmp_buf(1) = efires_tmp
+         call mpi_allreduce(MPI_IN_PLACE, efires_tmp_buf, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+         efires_tmp = efires_tmp_buf(1)
          if (fires_debug .and. master) write(6,'(a,i7,a,1pe12.5)') 'DBG[MTS]: exit reduce efires_tmp (final) nstep=', nstep, ' val=', efires_tmp
       end if
 #endif
@@ -2563,9 +2625,6 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
          totener%pot%constraint = totener%pot%constraint + efires_report
          totener%pot%tot        = totener%pot%tot        + efires_report
       end if
-
-      f_slow_cache(1:nr3) = f(1:nr3)
-        f_slow_cache_valid = .true.
 
         ! Skip velocity capping inside FIRES; vlimit handled in the standard path
 

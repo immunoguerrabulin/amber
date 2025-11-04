@@ -28,7 +28,7 @@ module qmmm_fires_module
   include 'mpif.h'
 #endif
     private
-    public :: FireMasks, calculate_fires_force, fires_force, setup_fires, fires_set_local_bounds, fires_restraint_enabled, fires_prepare_if_needed, fires_mask_signature
+    public :: FireMasks, calculate_fires_force, fires_force, setup_fires, fires_set_local_bounds, fires_restraint_enabled, fires_prepare_if_needed, fires_mask_signature, fires_set_step
     ! Debug/diagnostics: last computed FIRES force components
     _REAL_, public, save :: last_f_pot(3)           = 0.0d0
     _REAL_, public, save :: last_f_inner_water(3)   = 0.0d0
@@ -51,8 +51,12 @@ module qmmm_fires_module
     ! Optional band filter: when enabled, only atoms with |r - rmax| <= halfwidth are considered
     logical, public, save :: fires_band_filter_enabled = .false.
     _REAL_,  public, save :: fires_band_halfwidth = 6.0d0
+    ! Freezing controls
+    logical, public, save :: fires_static_mask     = .false.
+    integer, public, save :: fires_freeze_on_nstep = 1
+    integer, save :: fires_current_step            = 0  ! cached md step for freeze gating
     ! Hysteresis control to stabilize mask membership near the boundary
-    logical, public, save :: fires_hyst_enabled = .true.
+    logical, public, save :: fires_hyst_enabled    = .false.
     _REAL_,  public, save :: fires_hyst_rin  = 3.9d0
     _REAL_,  public, save :: fires_hyst_rout = 4.1d0
     ! Track whether the last call to force() already injected FIRES into the total force
@@ -261,6 +265,8 @@ contains
         integer :: i, counter
         character(len=256) :: s_inner, s_inw, s_outer
         integer :: prnlev
+
+        if (fires_static_mask) return
 
         if (fires_natom <= 0 .or. fires_nres <= 0) return
 
@@ -597,7 +603,7 @@ contains
         _REAL_, intent(inout) :: f(3*natom)
         _REAL_ :: efires
 
-! Bring in MD common block definitions (nstep, etc.) before any executable code
+! Bring in MD counters (nstep, etc.)
 #include "../include/md.h"
 
         ! locals
@@ -657,16 +663,33 @@ contains
     ! Debug printing removed to reduce runtime verbosity.
 
     ! If any selection looks empty, recompute masks with current coordinates (only if enabled)
-    if (fires_need_first_refresh) then
-        call refresh_fires_masks(x)
-        did_refresh = .true.
-        fires_need_first_refresh = .false.
-    else if (fires_refresh_runtime) then
-        if (size(masks%outer_mask) == 0 .or. size(masks%inner_mask) == 0) then
+    associate(nstep => fires_current_step)
+        if (fires_need_first_refresh) then
             call refresh_fires_masks(x)
             did_refresh = .true.
+            fires_need_first_refresh = .false.
+
+            if (nstep >= fires_freeze_on_nstep) then
+                fires_static_mask     = .true.
+                fires_refresh_runtime = .false.
+                fires_hyst_enabled    = .false.
+            end if
+
+        else
+            if (.not. fires_static_mask .and. nstep >= fires_freeze_on_nstep) then
+                fires_static_mask     = .true.
+                fires_refresh_runtime = .false.
+                fires_hyst_enabled    = .false.
+            end if
+
+            if (fires_refresh_runtime) then
+                if (size(masks%outer_mask) == 0 .or. size(masks%inner_mask) == 0) then
+                    call refresh_fires_masks(x)
+                    did_refresh = .true.
+                end if
+            end if
         end if
-    end if
+    end associate
 
     call get_center(x, mass, com)
 
@@ -1124,12 +1147,18 @@ contains
     end subroutine calculate_fires_force
 
             ! --- FIRES helper: set local 3*index bounds for this rank ---
-            subroutine fires_set_local_bounds(istart3_in, iend3_in)
-                implicit none
-                integer, intent(in) :: istart3_in, iend3_in
-                g_loc_istart3 = istart3_in
-                g_loc_iend3   = iend3_in
+    subroutine fires_set_local_bounds(istart3_in, iend3_in)
+        implicit none
+        integer, intent(in) :: istart3_in, iend3_in
+        g_loc_istart3 = istart3_in
+        g_loc_iend3   = iend3_in
 end subroutine fires_set_local_bounds
+
+    subroutine fires_set_step(step)
+        implicit none
+        integer, intent(in) :: step
+        fires_current_step = step
+    end subroutine fires_set_step
 
     subroutine fires_force(x,mass,natom, f, epot)
         implicit none
