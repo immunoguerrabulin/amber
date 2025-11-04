@@ -344,6 +344,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical skip_force_refresh
   logical skip_outer_shake
   logical skip_standard_position_update
+  logical skip_langevin_update
   logical do_fires_mts
   logical :: reuse_intent_local, reuse_for_all
   logical :: part_changed_local, part_changed_any
@@ -3674,9 +3675,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     sdfacles = sqrt(4.d0 * gammai * boltz2 * temp0les / dtx)
 #endif /* LES */
 
+    skip_langevin_update = .false.
 #ifdef MPI /* SOFT CORE */
-    f_det_scale = 1.0d0
-    if (do_fires_mts) f_det_scale = 0.0d0
     if (ifsc == 1) then
       if (do_fires_mts) then
         if (allocated(f_langevin_zero)) then
@@ -3698,11 +3698,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
          call bellyf_softcore(v,vold,istart,iend)
          call bellyf(nr,ix(ibellygp),v)
       end if
-    else
+      skip_langevin_update = .true.
+    end if
 #endif
-    f_det_scale = 1.0d0
-    if (do_fires_mts) f_det_scale = 0.0d0
-    if (no_ntt3_sync == 1) then
+
+    if (.not. skip_langevin_update) then
+      f_det_scale = 1.0d0
+      if (do_fires_mts) f_det_scale = 0.0d0
+      if (no_ntt3_sync == 1) then
 
       ! We don't worry about synchronizing the random number stream
       ! across processors.
@@ -3765,9 +3768,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         ! Skip some random numbers
         call gauss(0.d0, 1.d0, fln)
       end do
-#ifdef MPI /* SOFT CORE */
-    end if ! for (ifsc==1) call sc_lngdyn
-#endif
+    end if
   end if  ! ( gammai == 0.d0 )
   !  }}}
   ! End case switch for various thermostats
