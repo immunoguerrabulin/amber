@@ -224,6 +224,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   integer   ipairs(*), ix(*)
   _REAL_ xx(*)
   character(len=4) ih(*)
+  logical :: saved_fires_band_filter_enabled
 #ifdef MPI
 #  include "parallel.h"
   _REAL_ mpitmp(8) !Use for temporary packing of mpi messages.
@@ -237,7 +238,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_ :: ener_kin_tot_buf(1), totener_kin_tot_buf(1)
   integer :: fires_buf(1), mts_n_buf(1)
   _REAL_ :: mts_fires_buf(1), fires_k_buf(1), fires_band_halfwidth_buf(1)
-  logical :: saved_fires_band_filter_enabled, fires_band_filter_enabled_buf(1)
+  logical :: fires_band_filter_enabled_buf(1)
 #else
   ! mdloop and REM is always 0 in serial
   integer, parameter :: mdloop = 0, rem = 0, remd_types(1) = 0, replica_indexes(1) = 0
@@ -426,6 +427,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical qsetup
   _REAL_, allocatable, dimension(:) :: f_or
   _REAL_, allocatable, save :: f_slow_cache(:)
+  _REAL_, allocatable, save :: f_langevin_zero(:)
 
   ! JOSE MOD (FIRES MTS) locals
   integer :: sub
@@ -445,6 +447,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_, allocatable, dimension(:) :: frcti
 
   _REAL_ small
+  _REAL_ f_det_scale
   data small/1.0d-7/
 
   !--- VARIABLES FOR DIPOLE PRINTING ---
@@ -3672,15 +3675,33 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #endif /* LES */
 
 #ifdef MPI /* SOFT CORE */
+    f_det_scale = 1.0d0
+    if (do_fires_mts) f_det_scale = 0.0d0
     if (ifsc == 1) then
-      call sc_lngdyn(winv, amass, v, f, sdfac, c_explic, c_implic, &
-                     istart, iend, nr, dtx)
+      if (do_fires_mts) then
+        if (allocated(f_langevin_zero)) then
+          if (size(f_langevin_zero) /= nr3) then
+            deallocate(f_langevin_zero)
+          end if
+        end if
+        if (.not. allocated(f_langevin_zero)) then
+          allocate(f_langevin_zero(nr3))
+        end if
+        f_langevin_zero(1:nr3) = 0.0d0
+        call sc_lngdyn(winv, amass, v, f_langevin_zero, sdfac, c_explic, c_implic, &
+                       istart, iend, nr, dtx)
+      else
+        call sc_lngdyn(winv, amass, v, f, sdfac, c_explic, c_implic, &
+                       istart, iend, nr, dtx)
+      end if
       if (ibelly > 0) then
          call bellyf_softcore(v,vold,istart,iend)
          call bellyf(nr,ix(ibellygp),v)
       end if
     else
 #endif
+    f_det_scale = 1.0d0
+    if (do_fires_mts) f_det_scale = 0.0d0
     if (no_ntt3_sync == 1) then
 
       ! We don't worry about synchronizing the random number stream
@@ -3724,11 +3745,11 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         rsd = sdfac*sqrt(aamass)
 #endif /* LES */
         call gauss(0.d0, rsd, fln)
-        v(i3+1) = (v(i3+1)*c_explic + (f(i3+1)+fln)*wfac) * c_implic
+        v(i3+1) = (v(i3+1)*c_explic + (f_det_scale*f(i3+1)+fln)*wfac) * c_implic
         call gauss(0.d0, rsd, fln)
-        v(i3+2) = (v(i3+2)*c_explic + (f(i3+2)+fln)*wfac) * c_implic
+        v(i3+2) = (v(i3+2)*c_explic + (f_det_scale*f(i3+2)+fln)*wfac) * c_implic
         call gauss(0.d0, rsd, fln)
-        v(i3+3) = (v(i3+3)*c_explic + (f(i3+3)+fln)*wfac) * c_implic
+        v(i3+3) = (v(i3+3)*c_explic + (f_det_scale*f(i3+3)+fln)*wfac) * c_implic
         i3 = i3 + 3
       end do
       if (ibelly > 0) then
