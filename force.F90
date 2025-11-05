@@ -37,7 +37,8 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
                  onereff, qsetup, do_list_update, nstep, skip_slow, f_slow_out)
 
   use qmmm_fires_module, only: fires, fires_force, fire_inner, fire_outer, mts_fires, mts_n, &
-                               fires_in_force, fires_set_step  !JOSE MOD: include MTS controls
+                               fires_in_force, fires_set_step, fires_set_local_bounds, &
+                               fires_prepare_if_needed  !JOSE MOD: include MTS controls
   
 #if !defined(DISABLE_NFE)
   use nfe_sander_hooks, only: nfe_on_force => on_force
@@ -1254,6 +1255,8 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
         if (want_slow_out .and. local_span > 0) then
           fslow(1:local_span) = f(istart3_local:iend3_local)
         end if
+        call fires_set_local_bounds(istart3_local, iend3_local)
+        call fires_prepare_if_needed(x, xx(lmass), natom)
         call fires_force(x, xx(lmass), natom, f, efires)
         if (want_slow_out .and. local_span > 0) then
           fslow(1:local_span) = f(istart3_local:iend3_local) - fslow(1:local_span)

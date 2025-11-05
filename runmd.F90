@@ -366,6 +366,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   integer(int64), save :: sig_prev(3) = 0_int64
   integer,        save :: counts_prev(3) = (/ -1, -1, -1 /)
   logical,        save :: have_prev_sig = .false.
+  logical,        save :: fires_force_warned = .false.
   _REAL_ x(*), winv(*), amass(*), f(*), v(*), vold(*), xr(*), xc(*), conp(*)
   type(state_rec) :: ener   ! energy values per time step
   type(state_rec) :: enert  ! energy values tallied over the time steps
@@ -2189,6 +2190,13 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     ! Always invoke force(); optionally skip slow terms and add cached result
     call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), xx(l97), &
                xx(l98), xx(l99), qsetup, do_list_update, nstep)
+
+    if (fires == 1 .and. mts_n > 1) then
+      if (fires_in_force .and. .not. fires_force_warned .and. master) then
+        write(6,'(a)') 'FIRES WARN: force() included FIRES while MTS is enabled; subtracting in slow half-kick.'
+        fires_force_warned = .true.
+      end if
+    end if
 
     if (use_cached_slow_force) then
       if (allocated(f_slow_cache)) then

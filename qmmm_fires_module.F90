@@ -1330,6 +1330,14 @@ end subroutine fires_set_local_bounds
             epot = 0.0d0
             return
         end if
+        if (.not. allocated(masks%inner_mask)) then
+            epot = 0.0d0
+            return
+        end if
+        if (size(masks%inner_mask) <= 0) then
+            epot = 0.0d0
+            return
+        end if
         call calculate_fires_force(x,mass,natom, f, efires)
         epot = efires
     end subroutine fires_force
