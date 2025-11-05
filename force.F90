@@ -36,7 +36,8 @@
 subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
                  onereff, qsetup, do_list_update, nstep)
 
-  use qmmm_fires_module, only: fires,fires_force,fire_inner,fire_outer, mts_fires, mts_n  !JOSE MOD: include MTS controls
+  use qmmm_fires_module, only: fires, fires_force, fires_in_force, &
+       fires_set_local_bounds, mts_fires, mts_n
   
 #if !defined(DISABLE_NFE)
   use nfe_sander_hooks, only: nfe_on_force => on_force
@@ -219,6 +220,7 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
   _REAL_  enmr(6), devdis(4), devang(4), devtor(4), devpln(4), devplpt(4), &
        devgendis(4), entr, ecap, enfe
   _REAL_ efires
+  _REAL_ efires_local
   _REAL_  x(*), f(*), vir(4)
   type(state_rec)  ener
 
@@ -306,6 +308,7 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
   end if
   ene(:) = ZERO
   call zero_pot_energy(pot)
+  fires_in_force = .false.
 
   belly = ibelly > 0
 
@@ -1220,9 +1223,21 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
 
 
 
-  if (fires==1) then
-    !JOSE MOD: FIRES is the fast force — evaluate every step (no MTS caching)
-    call fires_force(x,xx(lmass),natom,f,efires)
+  efires      = 0.0d0
+  efires_local = 0.0d0
+  if (fires == 1) then
+    if (.not. (mts_n > 1 .and. mts_fires > 0.0d0)) then
+      call fires_set_local_bounds(istart3, iend3)
+      call fires_force(x, xx(lmass), natom, f, efires_local)
+#ifdef MPI
+      efires = efires_local
+      call mpi_allreduce(efires_local, efires, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+#else
+      efires = efires_local
+#endif
+      pot%constraint = pot%constraint + efires
+      fires_in_force = .true.
+    end if
   end if
  
   

@@ -178,6 +178,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   use abfqmmm_module, only: abfqmmm_param, abfqmmm_combine_forces
 
   use qmmm_fires_module, only: fires, setup_fires, fires_force, mts_fires, mts_n, &
+       fires_prepare_if_needed, fires_set_local_bounds, fires_set_step, &
+       fires_band_filter_enabled, fires_band_halfwidth, fires_static_mask, &
+       fires_freeze_on_nstep, fires_in_force, fires_k, fires_restraint_enabled, &
        last_f_pot, last_f_inner_water, last_f_pen_water, last_n_pen, last_n_inw_out, &
        last_rmax, last_anchor_idx, last_rmax_inw, last_inw_max_idx, last_pen_atom_idx, &
        last_pen_r, last_pen_depth  !JOSE MOD (FIRES + MTS)
@@ -238,7 +241,6 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_ sinsh2, sinsh4, sinsh8, tt, erlxt, erlxt2, erlixt2, tktk
   _REAL_ st, st1, aaa, bbb, esi, esim, erlst2, hkin, hhin, tkkk
   _REAL_ boltz, etlci, davalev, clfs, tkik, rndbim(3)
-  _REAL_ fires_magnitude  ! JOSE MOD: for MTS FIRES magnitude check
 #ifdef MPI
   _REAL_ sdavalev(numtasks), sclfs, davalevs
   _REAL_ s1a(natom), s2a(natom), s3a(natom)
@@ -350,6 +352,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ! Variables and parameters for constant surface tension:
   ! ten_conv converts dyne/cm to bar angstroms
   _REAL_, parameter :: ten_conv = 100.0d0
+  _REAL_, parameter :: FIRES_FORCE_EPS = 1.0d-12
   _REAL_  :: pres0x
   _REAL_  :: pres0y
   _REAL_  :: pres0z
@@ -368,8 +371,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
   ! JOSE MOD (FIRES MTS) locals
   integer :: sub
-  _REAL_  :: dtx_fast, efires_tmp
-  _REAL_, allocatable :: f_slow(:), f_fires_curr(:)
+  _REAL_  :: dtx_fast, efires_local, efires_total, efires_report
+  _REAL_  :: fires_magnitude_local, fires_magnitude_global
+  _REAL_, allocatable :: f_slow(:), f_fires_curr(:), f_fires_buffer(:)
+  logical :: band_filter_saved
   
 #ifdef RISMSANDER
   logical irismdump
@@ -520,6 +525,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #endif
   istart3 = 3*istart -2
   iend3 = 3*iend
+  call fires_set_local_bounds(istart3, iend3)
 
 #ifdef MPI
   if (icfe /= 0) then
@@ -845,7 +851,20 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ! Initialize FIRES masks and data structures once at startup  !JOSE MOD
   if (fires == 1) then  !JOSE MOD
     call setup_fires(natom, nres, ix, ih, x, nbonh, nbona)  !JOSE MOD
+    call fires_prepare_if_needed(x, amass, natom)
   end if  !JOSE MOD
+
+#ifdef MPI
+  call mpi_bcast(fires, 1, mpi_integer, 0, commsander, ierr)
+  call mpi_bcast(mts_n, 1, mpi_integer, 0, commsander, ierr)
+  call mpi_bcast(mts_fires, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+  call mpi_bcast(fires_k, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+  call mpi_bcast(fires_band_filter_enabled, 1, MPI_LOGICAL, 0, commsander, ierr)
+  call mpi_bcast(fires_restraint_enabled, 1, MPI_LOGICAL, 0, commsander, ierr)
+  call mpi_bcast(fires_band_halfwidth, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+  call mpi_bcast(fires_freeze_on_nstep, 1, mpi_integer, 0, commsander, ierr)
+  call mpi_bcast(fires_static_mask, 1, MPI_LOGICAL, 0, commsander, ierr)
+#endif
 
   
 !------------------------------------------------------------------------------
@@ -1728,6 +1747,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ! EKMH holds the kinetic energy at these "-1/2" velocities, which are
   ! stored in the array vold.
   260 continue
+  call fires_set_step(nstep)
   onstep = mod(irespa,nrespa) == 0
 
   ! Deciding if in the current step we are gonna perform a constant pH titration
@@ -1900,6 +1920,13 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), xx(l97), &
                xx(l98), xx(l99), qsetup, do_list_update,nstep)
 
+    if (fires == 1 .and. mts_n > 1 .and. mts_fires > 0.0d0 .and. fires_in_force) then
+      if (master) then
+        write(6,'(a)') 'FIRES WARNING: force() applied FIRES during MTS; disabling reuse this step.'
+      end if
+      fires_in_force = .false.
+    end if
+
 !---------- BEGIN FIRES MTS ---------------------------------------------------
 
 
@@ -1914,25 +1941,40 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       call timer_start(TIME_VERLET)
 
       xold(istart3:iend3) = x(istart3:iend3)
+      band_filter_saved = fires_band_filter_enabled
+      efires_report = 0.0d0
       
   ! Allocate temporaries for local degrees of freedom
       allocate(f_slow(nr3))
       f_slow = 0.d0
       allocate(f_fires_curr(nr3))
       f_fires_curr = 0.d0
+      allocate(f_fires_buffer(3*natom))
+      f_fires_buffer = 0.d0
+
+      call fires_set_local_bounds(istart3, iend3)
 
       ! Compute initial FIRES force; note: force() does NOT include FIRES,
       ! so the slow force is just the current total f from force().
-      f_fires_curr(1:nr3) = 0.d0
-      call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
+      call fires_force(x, amass, natom, f_fires_buffer, efires_local)
+      f_fires_curr(1:nr3) = f_fires_buffer(istart3:iend3)
       
       ! Check if FIRES is actually active - if all forces are tiny, skip MTS
-      fires_magnitude = 0.0d0
+      fires_magnitude_local = 0.0d0
       do i3 = 1, nr3
-        fires_magnitude = fires_magnitude + f_fires_curr(i3)*f_fires_curr(i3)
+        fires_magnitude_local = fires_magnitude_local + f_fires_curr(i3)*f_fires_curr(i3)
       end do
+#ifdef MPI
+      fires_magnitude_global = fires_magnitude_local
+      call mpi_allreduce(fires_magnitude_local, fires_magnitude_global, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+      efires_total = efires_local
+      call mpi_allreduce(efires_local, efires_total, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+#else
+      fires_magnitude_global = fires_magnitude_local
+      efires_total = efires_local
+#endif
       
-      if (fires_magnitude < 1.0d-12) then
+      if (fires_magnitude_global < FIRES_FORCE_EPS) then
          ! FIRES is essentially zero - just use standard integration
          if (master) then
             write(6,'(a)') '| JOSE: FIRES forces negligible, using standard integration'
@@ -1940,6 +1982,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
          
          deallocate(f_slow)
          deallocate(f_fires_curr)
+         deallocate(f_fires_buffer)
+         fires_band_filter_enabled = band_filter_saved
 
          call timer_stop(TIME_VERLET)
          ! Fall through to standard integration
@@ -1981,8 +2025,15 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
             ! JOSE (MTS): Velocity-Verlet for fast force only
             ! 1) compute FIRES on current positions
             
-            f_fires_curr(1:nr3) = 0.d0
-            call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
+            if (sub == 1) then
+               fires_band_filter_enabled = .false.
+            else
+               fires_band_filter_enabled = band_filter_saved
+            end if
+
+            f_fires_buffer = 0.d0
+            call fires_force(x, amass, natom, f_fires_buffer, efires_local)
+            f_fires_curr(1:nr3) = f_fires_buffer(istart3:iend3)
 
             ! 2) first half-kick with FIRES
             i3 = 3*(istart - 1)
@@ -2003,8 +2054,16 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
             end do
 
             ! 4) recompute FIRES on new positions
-            f_fires_curr(1:nr3) = 0.d0
-            call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
+            f_fires_buffer = 0.d0
+            call fires_force(x, amass, natom, f_fires_buffer, efires_local)
+            f_fires_curr(1:nr3) = f_fires_buffer(istart3:iend3)
+#ifdef MPI
+            efires_total = efires_local
+            call mpi_allreduce(efires_local, efires_total, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+#else
+            efires_total = efires_local
+#endif
+            efires_report = efires_report + efires_total
             
             ! 5) second half-kick with NEW FIRES
             i3 = 3*(istart - 1)
@@ -2017,9 +2076,12 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
             end do
          end do
          
+         fires_band_filter_enabled = band_filter_saved
+
          ! JOSE (MTS): Recompute slow force at end positions and apply second half-kick
          call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), xx(l97), &
               xx(l98), xx(l99), qsetup, do_list_update, nstep)
+         ener%pot%constraint = ener%pot%constraint + efires_report
          ! f now holds the up-to-date (slow) force at end of the outer step
          i3 = 3*(istart - 1)
          do j = istart, iend
@@ -2032,7 +2094,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
          
          ! At end, set f to the latest total force (slow_end + FIRES at end)
          do i3 = 1, nr3
-            f(i3) = f(i3) + f_fires_curr(i3) ! tjg: doesn't this include fires twice?  force() includes fires
+            f(i3) = f(i3) + f_fires_curr(i3)
          end do
          
          ! Consider vlimit (cap velocities) since we skip the standard path below
@@ -2052,6 +2114,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
          
          deallocate(f_slow)
          deallocate(f_fires_curr)
+         deallocate(f_fires_buffer)
+         fires_band_filter_enabled = band_filter_saved
 
          call timer_stop(TIME_VERLET)
          ! Skip the standard velocity/position update path

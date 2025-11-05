@@ -24,7 +24,8 @@ module qmmm_fires_module
     use findmask
     implicit none
     private
-    public :: FireMasks,calculate_fires_force, fires_force, setup_fires
+    public :: FireMasks, calculate_fires_force, fires_force, setup_fires, &
+              fires_prepare_if_needed, fires_set_local_bounds, fires_set_step
     ! Debug/diagnostics: last computed FIRES force components
     _REAL_, public, save :: last_f_pot(3)           = 0.0d0
     _REAL_, public, save :: last_f_inner_water(3)   = 0.0d0
@@ -52,6 +53,14 @@ module qmmm_fires_module
     ! (deleted unused ipres/igraph/isymbl/lbres/crd/nsc/inner_atoms/outer_atoms)
     ! Control whether to auto-refresh FIRES masks at runtime (each step). Default: off
     logical, public, save :: fires_refresh_runtime = .false.
+    logical, public, save :: fires_restraint_enabled = .true.
+    logical, public, save :: fires_static_mask = .false.
+    logical, public, save :: fires_band_filter_enabled = .false.
+    _REAL_,  public, save :: fires_band_halfwidth = 0.0d0
+    logical, public, save :: fires_in_force = .false.
+    integer, public, save :: fires_freeze_on_nstep = 0
+    integer, parameter :: fires_hash_kind = selected_int_kind(18)
+    integer(fires_hash_kind), public, save :: fires_mask_signature = 0_fires_hash_kind
 
     ! Boundary radius control: 0 = derive from inner solute extent (default)
     !                           1 = use constant radius (fires_rmax_const) from inner COM
@@ -84,6 +93,8 @@ module qmmm_fires_module
     logical, save :: fires_notice_printed = .false.
     ! Center control: 0 = use COM of inner mask; >0 = use this atom index as center
     integer, public, save :: fires_center_atom = 0
+    integer, save :: g_loc_istart3 = 1
+    integer, save :: g_loc_iend3   = 0
 
 contains
 
@@ -231,11 +242,102 @@ contains
         end if
 
     !JOSE Comment: mark as initialized to prevent double allocation on later calls
+    call update_fires_mask_signature()
+
     fires_initialized = .true.
     fires_need_first_refresh = .true.
     end subroutine setup_fires
 
+    subroutine fires_set_local_bounds(istart3_in, iend3_in)
+        implicit none
+        integer, intent(in) :: istart3_in, iend3_in
+
+        g_loc_istart3 = max(1, istart3_in)
+        g_loc_iend3   = iend3_in
+    end subroutine fires_set_local_bounds
+
+    subroutine fires_prepare_if_needed(x, mass, natom)
+        implicit none
+        integer, intent(in) :: natom
+        _REAL_, intent(in)  :: x(3*natom)
+        _REAL_, intent(in)  :: mass(natom)
+
+        if (fires == 0) return
+        if (fires_k <= 0.0d0) return
+
+        if (fires_need_first_refresh) then
+            call refresh_fires_masks(x)
+            fires_need_first_refresh = .false.
+        end if
+
+        call update_fires_mask_signature()
+    end subroutine fires_prepare_if_needed
+
+    subroutine fires_set_step(nstep)
+        use memory_module, only : x
+        implicit none
+        integer, intent(in) :: nstep
+#include "../include/memory.h"
+
+        if (fires == 0) return
+
+        if (fires_freeze_on_nstep > 0 .and. nstep == fires_freeze_on_nstep) then
+            if (.not. fires_static_mask) then
+                call refresh_fires_masks(x(lcrd))
+                fires_static_mask = .true.
+            end if
+        else if (.not. fires_static_mask .and. fires_refresh_runtime) then
+            call refresh_fires_masks(x(lcrd))
+        end if
+
+        call update_fires_mask_signature()
+    end subroutine fires_set_step
+
     ! Re-evaluate FIRES masks on demand using current coordinates
+    subroutine update_fires_mask_signature()
+        implicit none
+        integer :: i
+        integer(fires_hash_kind) :: sig
+        sig = 0_fires_hash_kind
+
+        if (allocated(masks%inner_mask)) then
+            do i = 1, size(masks%inner_mask)
+                sig = ieor(sig, int(masks%inner_mask(i), fires_hash_kind))
+            end do
+        end if
+        if (allocated(masks%inner_solvent_mask)) then
+            do i = 1, size(masks%inner_solvent_mask)
+                sig = ieor(sig, ishft(int(masks%inner_solvent_mask(i), fires_hash_kind), 1))
+            end do
+        end if
+        if (allocated(masks%outer_mask)) then
+            do i = 1, size(masks%outer_mask)
+                sig = ieor(sig, ishft(int(masks%outer_mask(i), fires_hash_kind), 2))
+            end do
+        end if
+        fires_mask_signature = sig
+    end subroutine update_fires_mask_signature
+
+    logical function index_in_local_range(idx3)
+        implicit none
+        integer, intent(in) :: idx3
+
+        if (g_loc_iend3 >= g_loc_istart3 .and. g_loc_iend3 > 0) then
+            index_in_local_range = (idx3 >= g_loc_istart3 .and. idx3 <= g_loc_iend3)
+        else
+            index_in_local_range = .true.
+        end if
+    end function index_in_local_range
+
+    logical function atom_is_local(atom_index)
+        implicit none
+        integer, intent(in) :: atom_index
+        integer :: idx3
+
+        idx3 = 3*atom_index - 2
+        atom_is_local = index_in_local_range(idx3) .and. index_in_local_range(idx3+2)
+    end function atom_is_local
+
     subroutine refresh_fires_masks(xcur)
         use memory_module, only: atom_name, amber_atom_type, residue_label, residue_pointer
         implicit none
@@ -291,6 +393,7 @@ contains
         write(6,'(a,i0)') 'FIRES: Inner region size: ', size(masks%inner_mask)
         write(6,'(a,i0)') 'FIRES: Inner solvent size: ', size(masks%inner_solvent_mask)
         write(6,'(a,i0)') 'FIRES: Outer region size: ', size(masks%outer_mask)
+        call update_fires_mask_signature()
     end subroutine refresh_fires_masks
 
     subroutine calculate_fires_force_slow(x,natom,f,efires)
@@ -711,7 +814,9 @@ contains
                     delta = r - rmax  ! negative
                     ! Applied force on penetrating outer atom
                     fa = -fires_k * delta * ui
-                    f(a:a+2) = f(a:a+2) + fa
+                    if (atom_is_local(atom_index)) then
+                        f(a:a+2) = f(a:a+2) + fa
+                    end if
                     ! Reaction on inner COM is negative of applied forces
                     f_react_com = f_react_com - fa
                     f_sum_pen = f_sum_pen + fa
@@ -739,7 +844,9 @@ contains
                     delta = r - rmax  ! positive
                     ! Applied force on inner (non-water) atom: pull inward
                     fa = -fires_k * delta * ui
-                    f(a:a+2) = f(a:a+2) + fa
+                    if (atom_is_local(atom_index)) then
+                        f(a:a+2) = f(a:a+2) + fa
+                    end if
                     ! Reaction applied to inner COM to conserve momentum
                     f_react_com = f_react_com - fa
                     eacc = eacc + 0.5D0 * fires_k * (r - rmax)*(r - rmax)
@@ -768,7 +875,9 @@ contains
                     ui = dr / max(r, EPS)
                     delta = r - rmax
                     fa = -fires_k * delta * ui
-                    f(a:a+2) = f(a:a+2) + fa
+                    if (atom_is_local(atom_index)) then
+                        f(a:a+2) = f(a:a+2) + fa
+                    end if
                     f_react_com = f_react_com - fa
                     f_sum_inw = f_sum_inw + fa
                     last_n_inw_out = last_n_inw_out + 1
@@ -787,7 +896,9 @@ contains
                 atom_index = masks%inner_mask(i)
                 if (atom_index .gt. 0) then
                     a = 3*atom_index - 2
-                    f(a:a+2) = f(a:a+2) + (mass(atom_index)/m_tot_inner) * f_react_com
+                    if (atom_is_local(atom_index)) then
+                        f(a:a+2) = f(a:a+2) + (mass(atom_index)/m_tot_inner) * f_react_com
+                    end if
                 else
                     exit
                 end if
@@ -830,12 +941,29 @@ contains
         _REAL_,intent(out) ::  epot
         _REAL_ :: efires
         
+        integer :: lstart, lend
+
         epot = 0.d0
-        ! Early gate if FIRES disabled or zero strength
-        if (fires == 0 .or. fires_k <= 0.0d0) then
+
+        ! Determine local bounds (defaults to the whole array in serial runs)
+        lstart = max(1, g_loc_istart3)
+        lend   = g_loc_iend3
+        if (lend <= 0 .or. lend < lstart) then
+            lstart = 1
+            lend   = 3*natom
+        else
+            lend   = min(lend, 3*natom)
+            lstart = min(max(lstart, 1), lend)
+        end if
+
+        if (lend >= lstart) f(lstart:lend) = 0.0d0
+
+        ! Early gate if FIRES disabled or zero strength or globally disabled
+        if (fires == 0 .or. fires_k <= 0.0d0 .or. .not. fires_restraint_enabled) then
             epot = 0.0d0
             return
         end if
+
         call calculate_fires_force(x,mass,natom, f, efires)
         epot = efires
     end subroutine fires_force
