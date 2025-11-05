@@ -52,6 +52,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 ! modules used:  {{{
 
   use state
+  use iso_fortran_env, only : int64
 
 #if !defined(DISABLE_NFE) && defined(NFE_ENABLE_BBMD)
   use nfe_sander_hooks, only : nfe_on_mdstep => on_mdstep
@@ -72,6 +73,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   use nose_hoover_module, only: thermo_lnv, x_lnv, x_lnv_old, v_lnv, &
                                 f_lnv_p, f_lnv_v, c2_lnv, mass_lnv, &
                                 Thermostat_init
+#ifdef MPI
+  use mpi
+#endif
 #ifdef RISMSANDER
   use sander_rism_interface, only: rismprm, RISM_NONE, RISM_FULL, &
                                    RISM_INTERP, rism_calc_type, &
@@ -79,6 +83,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #endif /* RISMSANDER */
 
   use full_pimd_vars, only: totener,totenert,totenert2,mybeadid,xall
+  use qmmm_fires_module, only: fires_band_filter_enabled, fires_band_halfwidth
   use qmmm_module, only: qmmm_nml,qmmm_struct, qmmm_mpi, qm2_struct
 
 #ifdef MPI
@@ -177,10 +182,13 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   use crg_reloc, only: ifcr, crprintcharges, cr_print_charge
   use abfqmmm_module, only: abfqmmm_param, abfqmmm_combine_forces
 
-  use qmmm_fires_module, only: fires, setup_fires, fires_force, mts_fires, mts_n, &
-       last_f_pot, last_f_inner_water, last_f_pen_water, last_n_pen, last_n_inw_out, &
+  use qmmm_fires_module, only: fires, setup_fires, fires_force, fires_set_local_bounds, mts_fires, mts_n, &
+       fires_k, fire_inner, fire_inner_solvent, fire_outer, &
+       fires_in_force, fires_prepare_if_needed, fires_restraint_enabled, fires_set_step, &
+       fires_static_mask, fires_freeze_on_nstep, &
+        last_f_pot, last_f_inner_water, last_f_pen_water, last_n_pen, last_n_inw_out, &
        last_rmax, last_anchor_idx, last_rmax_inw, last_inw_max_idx, last_pen_atom_idx, &
-       last_pen_r, last_pen_depth  !JOSE MOD (FIRES + MTS)
+       last_pen_r, last_pen_depth, fires_mask_signature  !JOSE MOD (FIRES + MTS)
   
   ! Accelerated Molecular Dynamics (aMD)
   use amd_mod
@@ -216,11 +224,21 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   integer   ipairs(*), ix(*)
   _REAL_ xx(*)
   character(len=4) ih(*)
+  logical :: saved_fires_band_filter_enabled
 #ifdef MPI
 #  include "parallel.h"
-  include 'mpif.h'
   _REAL_ mpitmp(8) !Use for temporary packing of mpi messages.
+  _REAL_ mpitmp_recv(8)
   integer ist(MPI_STATUS_SIZE), partner
+  _REAL_ :: sc_dvdl_buf(1), sc_tot_dvdl_buf(1), sc_dvdl_ee_buf(1), sc_tot_dvdl_ee_buf(1)
+  _REAL_ :: sc_tot_dvdl_partner_buf(1), sc_tot_dvdl_partner_ee_buf(1)
+  _REAL_ :: clfs_buf(1), sclfs_buf(1), txtr_buf(1), stxtr_buf(1)
+  _REAL_ :: centvir_buf(1), atomvir_buf(1)
+  _REAL_ :: eke_cmd_buf(1), tmp_eke_cmd_buf(1)
+  _REAL_ :: ener_kin_tot_buf(1), totener_kin_tot_buf(1)
+  integer :: fires_buf(1), mts_n_buf(1)
+  _REAL_ :: mts_fires_buf(1), fires_k_buf(1), fires_band_halfwidth_buf(1)
+  logical :: fires_band_filter_enabled_buf(1)
 #else
   ! mdloop and REM is always 0 in serial
   integer, parameter :: mdloop = 0, rem = 0, remd_types(1) = 0, replica_indexes(1) = 0
@@ -239,6 +257,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_ st, st1, aaa, bbb, esi, esim, erlst2, hkin, hhin, tkkk
   _REAL_ boltz, etlci, davalev, clfs, tkik, rndbim(3)
   _REAL_ fires_magnitude  ! JOSE MOD: for MTS FIRES magnitude check
+  logical :: early_exit_local, early_exit_global  ! JOSE MOD: MPI-sync for FIRES early-exit
+  integer(int64) :: sig_local(3), sig_min(3), sig_max(3)
+  integer :: counts(3), counts_min(3), counts_max(3)
 #ifdef MPI
   _REAL_ sdavalev(numtasks), sclfs, davalevs
   _REAL_ s1a(natom), s2a(natom), s3a(natom)
@@ -319,6 +340,33 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical skip(*), belly, lout, loutfm, erstop, vlim, onstep
   ! Fortran does not guarantee short circuit logical expressions:
   logical is_remainder0
+  logical use_cached_slow_force
+  logical skip_force_refresh
+  logical skip_outer_shake
+  logical skip_standard_position_update
+  logical skip_langevin_update
+  logical do_fires_mts
+  logical :: reuse_intent_local, reuse_for_all
+  logical :: part_changed_local, part_changed_any
+  logical :: fires_restraint_enabled_local, fires_restraint_enabled_global
+  integer :: mts_n_local
+#ifdef MPI
+  integer :: mts_n_min(1), mts_n_max(1)
+  integer :: mask_flag_local(1), mask_flag_global(1)
+  integer :: mask_flag_min(1), mask_flag_max(1)
+  integer :: mpi_flag_buf(1)
+#endif
+  ! Debug controls for FIRES/MTS. Enable via FIRES_DEBUG=1 env var.
+  logical :: fires_debug = .false.
+  character(len=16) :: fires_debug_env
+  logical :: fires_disable_cache = .false.
+  character(len=16) :: fires_disable_cache_env
+  logical, save :: f_slow_cache_valid = .false.
+  integer, save :: istart3_prev = -1, iend3_prev = -1
+  integer(int64), save :: sig_prev(3) = 0_int64
+  integer,        save :: counts_prev(3) = (/ -1, -1, -1 /)
+  logical,        save :: have_prev_sig = .false.
+  logical,        save :: fires_force_warned = .false.
   _REAL_ x(*), winv(*), amass(*), f(*), v(*), vold(*), xr(*), xc(*), conp(*)
   type(state_rec) :: ener   ! energy values per time step
   type(state_rec) :: enert  ! energy values tallied over the time steps
@@ -327,6 +375,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   type(state_rec) :: enert_tmp, enert2_tmp
   type(state_rec) :: edvdl
   type(state_rec) :: edvdl_r
+  ! Debug sentinel accumulators (only used when FIRES_DEBUG is enabled)
+  _REAL_ :: maxabs, maxabs_buf(1)
+  integer :: nanflag, infflag
+  integer :: nanflag_buf(1), infflag_buf(1)
+#ifdef MPI
+  _REAL_ :: fires_magnitude_buf(1)
+  _REAL_ :: efires_tmp_buf(1)
+#endif
 
 #ifdef MPI
   type(state_rec) :: ecopy
@@ -334,9 +390,16 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #endif
   _REAL_ rmu(3), fac(3), onefac(3), etot_start
   _REAL_ tma(*)
-  _REAL_ tspan, atempdrop, fln, scaltp
+  _REAL_ tspan, atempdrop, fln, scaltp, scaltp_buf(1)
   _REAL_ vel, vel2, vcmx, vcmy, vcmz, vmax
   _REAL_ winf, aamass, rterm, ekmh, ekph, wfac, rsd
+  ! JOSE MTS fast-step Langevin params
+  _REAL_ dt5_fast, c_implic_fast, c_explic_fast, sdfac_fast
+#ifdef LES
+  _REAL_ sdfacles_fast
+#endif
+  ! JOSE MTS early-exit remainder-step params
+  _REAL_ dtx_rest, dt5_rest, c_implic_rest, c_explic_rest
   _REAL_ fit, fiti, fit2
 
   ! Variables to control a Langevin dynamics simulation
@@ -365,15 +428,17 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   logical ixdump, ivdump, itdump, ifdump
   logical qsetup
   _REAL_, allocatable, dimension(:) :: f_or
+  _REAL_, allocatable, save :: f_slow_cache(:)
+  _REAL_, allocatable, save :: f_langevin_zero(:)
 
   ! JOSE MOD (FIRES MTS) locals
   integer :: sub
-  _REAL_  :: dtx_fast, efires_tmp
+  _REAL_  :: dtx_fast, efires_tmp, efires_report
   _REAL_, allocatable :: f_slow(:), f_fires_curr(:)
   
 #ifdef RISMSANDER
   logical irismdump
-#  ifdef RISM_DEBUG
+#ifdef RISM_DEBUG
   _REAL_ r(3),cm(3),angvel(3),erot,moi,proj(3),rxv(3)
 #  endif
 #endif
@@ -384,6 +449,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   _REAL_, allocatable, dimension(:) :: frcti
 
   _REAL_ small
+  _REAL_ f_det_scale
   data small/1.0d-7/
 
   !--- VARIABLES FOR DIPOLE PRINTING ---
@@ -472,6 +538,11 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   loutfm = (ioutfm <= 0)
   nr = nrp
   nr3 = 3*nr
+
+  if (.not. allocated(f_slow_cache)) then
+    allocate(f_slow_cache(nr3))
+    f_slow_cache = 0.0d0
+  end if
   ekmh = 0.d0
 
   aqmmm_flag = 0
@@ -506,6 +577,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ekmhles = 0.d0
 #endif
   do_list_update = .false.
+  skip_force_refresh = .false.
+  use_cached_slow_force = .false.
+  skip_outer_shake = .false.
+  skip_standard_position_update = .false.
 #ifdef MPI
   if (mpi_orig) then
     istart = 1
@@ -825,6 +900,23 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ener%kin%pres_scale_solv = 1.d0
   ener%box(1:3) = box(1:3)
   ener%cmt(1:4) = 0.d0
+  ! Read debug flag and optional cache-disable once
+  fires_debug = .false.
+  call get_environment_variable('FIRES_DEBUG', fires_debug_env)
+  if (len_trim(fires_debug_env) > 0) then
+    select case (fires_debug_env(1:1))
+    case ('1','T','t','Y','y')
+      fires_debug = .true.
+    end select
+  end if
+  fires_disable_cache = .false.
+  call get_environment_variable('FIRES_DISABLE_CACHE', fires_disable_cache_env)
+  if (len_trim(fires_disable_cache_env) > 0) then
+    select case (fires_disable_cache_env(1:1))
+    case ('1','T','t','Y','y')
+      fires_disable_cache = .true.
+    end select
+  end if
   nitp = 0
   nits = 0
   if (ischeme > 0) then
@@ -842,9 +934,61 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
 
 !------------------------------------------------------------------------------
+  ! JOSE MOD (MPI sync): Broadcast FIRES/MTS configuration so all ranks agree
+#ifdef MPI
+  if (numtasks > 1) then
+    fires_buf(1) = fires
+    call mpi_bcast(fires_buf, 1, MPI_INTEGER, 0, commsander, ierr)
+    fires = fires_buf(1)
+    mts_n_buf(1) = mts_n
+    call mpi_bcast(mts_n_buf, 1, MPI_INTEGER, 0, commsander, ierr)
+    mts_n = mts_n_buf(1)
+    mts_fires_buf(1) = mts_fires
+    call mpi_bcast(mts_fires_buf, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+    mts_fires = mts_fires_buf(1)
+    fires_k_buf(1) = fires_k
+    call mpi_bcast(fires_k_buf, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+    fires_k = fires_k_buf(1)
+    fires_band_filter_enabled_buf(1) = fires_band_filter_enabled
+    call mpi_bcast(fires_band_filter_enabled_buf, 1, MPI_LOGICAL, 0, commsander, ierr)
+    fires_band_filter_enabled = fires_band_filter_enabled_buf(1)
+    fires_band_halfwidth_buf(1) = fires_band_halfwidth
+    call mpi_bcast(fires_band_halfwidth_buf, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+    fires_band_halfwidth = fires_band_halfwidth_buf(1)
+    call mpi_bcast(fire_inner, len(fire_inner), MPI_CHARACTER, 0, commsander, ierr)
+    call mpi_bcast(fire_inner_solvent, len(fire_inner_solvent), MPI_CHARACTER, 0, commsander, ierr)
+    call mpi_bcast(fire_outer, len(fire_outer), MPI_CHARACTER, 0, commsander, ierr)
+    mpi_flag_buf(1) = 0
+    if (fires_debug) mpi_flag_buf(1) = 1
+    call mpi_allreduce(MPI_IN_PLACE, mpi_flag_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+    fires_debug = (mpi_flag_buf(1) == 1)
+    mpi_flag_buf(1) = 0
+    if (fires_disable_cache) mpi_flag_buf(1) = 1
+    call mpi_allreduce(MPI_IN_PLACE, mpi_flag_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+    fires_disable_cache = (mpi_flag_buf(1) == 1)
+  end if
+#endif
+
+!------------------------------------------------------------------------------
   ! Initialize FIRES masks and data structures once at startup  !JOSE MOD
   if (fires == 1) then  !JOSE MOD
     call setup_fires(natom, nres, ix, ih, x, nbonh, nbona)  !JOSE MOD
+#ifdef MPI
+    if (numtasks > 1) then
+      call fires_mask_signature(sig_local(1), sig_local(2), sig_local(3), counts(1), counts(2), counts(3))
+      call mpi_allreduce(sig_local, sig_min, 3, MPI_INTEGER8, mpi_min, commsander, ierr)
+      call mpi_allreduce(sig_local, sig_max, 3, MPI_INTEGER8, mpi_max, commsander, ierr)
+      call mpi_allreduce(counts, counts_min, 3, MPI_INTEGER, mpi_min, commsander, ierr)
+      call mpi_allreduce(counts, counts_max, 3, MPI_INTEGER, mpi_max, commsander, ierr)
+      if (any(sig_min /= sig_max) .or. any(counts_min /= counts_max)) then
+        if (master) then
+          write(6,'(a)') 'FIRES ERROR: Mask mismatch detected across MPI ranks after synchronization.'
+          write(6,'(a,3i10)') 'FIRES local counts: ', counts
+        end if
+        call mexit(6, 1)
+      end if
+    end if
+#endif
   end if  !JOSE MOD
 
   
@@ -1052,17 +1196,21 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 !------------------------------------------------------------------------------
     ! If softcore potentials are used, collect their dvdl contributions:
     if (ifsc /= 0) then
-      call mpi_reduce(sc_dvdl, sc_tot_dvdl, 1, MPI_DOUBLE_PRECISION, &
+      sc_dvdl_buf(1) = sc_dvdl
+      call mpi_reduce(sc_dvdl_buf, sc_tot_dvdl_buf, 1, MPI_DOUBLE_PRECISION, &
                       MPI_SUM, 0, commsander, ierr)
+      if (master) sc_tot_dvdl = sc_tot_dvdl_buf(1)
 
       ! Zero dV/dLambda for the next stetp
       sc_dvdl=0.0d0
-      call mpi_reduce(sc_dvdl_ee, sc_tot_dvdl_ee, 1, MPI_DOUBLE_PRECISION, &
+      sc_dvdl_ee_buf(1) = sc_dvdl_ee
+      call mpi_reduce(sc_dvdl_ee_buf, sc_tot_dvdl_ee_buf, 1, MPI_DOUBLE_PRECISION, &
                       MPI_SUM, 0, commsander, ierr)
+      if (master) sc_tot_dvdl_ee = sc_tot_dvdl_ee_buf(1)
 
       ! Zero for the next step
       sc_dvdl_ee=0.0d0
-      call mpi_reduce(sc_ener, sc_ener_tmp, ti_ene_cnt, MPI_DOUBLE_PRECISION, &
+      call mpi_reduce(sc_ener(:), sc_ener_tmp(:), ti_ene_cnt, MPI_DOUBLE_PRECISION, &
                       MPI_SUM, 0, commsander, ierr)
       sc_ener(1:ti_ene_cnt) = sc_ener_tmp(1:ti_ene_cnt)
     end if
@@ -1092,12 +1240,18 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
                           partner, 5, commmaster, ist, ierr)
 
         ! Exchange sc-dvdl contributions between masters
-        call mpi_sendrecv(sc_tot_dvdl, 1, MPI_DOUBLE_PRECISION, partner, 5, &
-                          sc_tot_dvdl_partner, 1, MPI_DOUBLE_PRECISION, &
+        sc_tot_dvdl_buf(1) = sc_tot_dvdl
+        sc_tot_dvdl_partner_buf(1) = sc_tot_dvdl_partner
+        call mpi_sendrecv(sc_tot_dvdl_buf, 1, MPI_DOUBLE_PRECISION, partner, 5, &
+                          sc_tot_dvdl_partner_buf, 1, MPI_DOUBLE_PRECISION, &
                           partner, 5, commmaster, ist, ierr)
-        call mpi_sendrecv(sc_tot_dvdl_ee, 1, MPI_DOUBLE_PRECISION, partner, &
-                          5, sc_tot_dvdl_partner_ee, 1, MPI_DOUBLE_PRECISION, &
+        sc_tot_dvdl_partner = sc_tot_dvdl_partner_buf(1)
+        sc_tot_dvdl_ee_buf(1) = sc_tot_dvdl_ee
+        sc_tot_dvdl_partner_ee_buf(1) = sc_tot_dvdl_partner_ee
+        call mpi_sendrecv(sc_tot_dvdl_ee_buf, 1, MPI_DOUBLE_PRECISION, partner, &
+                          5, sc_tot_dvdl_partner_ee_buf, 1, MPI_DOUBLE_PRECISION, &
                           partner, 5, commmaster, ist, ierr )
+        sc_tot_dvdl_partner_ee = sc_tot_dvdl_partner_ee_buf(1)
         if (masterrank == 0) then
           call mix_frcti(frcti, ecopy, f, ener, nr3, clambda, klambda)
         else
@@ -1572,15 +1726,19 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
          v(1:3*natom)=0.d0
 
-         call mpi_allreduce(svs,v,3*natom,MPI_DOUBLE_PRECISION,MPI_SUM,commsander,ierr)
+         call mpi_allreduce(svs(:), v(1:3*natom), 3*natom, MPI_DOUBLE_PRECISION, &
+                            MPI_SUM, commsander, ierr)
 
          s1=0.d0
          s2=0.d0
          s3=0.d0
 
-         call mpi_allreduce(s1s,s1,natom,MPI_DOUBLE_PRECISION,MPI_SUM,commsander,ierr)
-         call mpi_allreduce(s2s,s2,natom,MPI_DOUBLE_PRECISION,MPI_SUM,commsander,ierr)
-         call mpi_allreduce(s3s,s3,natom,MPI_DOUBLE_PRECISION,MPI_SUM,commsander,ierr)
+         call mpi_allreduce(s1s(:), s1(:), natom, MPI_DOUBLE_PRECISION, MPI_SUM, &
+                            commsander, ierr)
+         call mpi_allreduce(s2s(:), s2(:), natom, MPI_DOUBLE_PRECISION, MPI_SUM, &
+                            commsander, ierr)
+         call mpi_allreduce(s3s(:), s3(:), natom, MPI_DOUBLE_PRECISION, MPI_SUM, &
+                            commsander, ierr)
 
       end if
 
@@ -1728,6 +1886,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ! EKMH holds the kinetic energy at these "-1/2" velocities, which are
   ! stored in the array vold.
   260 continue
+  skip_force_refresh = .false.
+  skip_outer_shake   = .false.
+  skip_standard_position_update = .false.
   onstep = mod(irespa,nrespa) == 0
 
   ! Deciding if in the current step we are gonna perform a constant pH titration
@@ -1862,7 +2023,11 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
   if (ipimd == NMPIMD .or. ipimd == CMD) then
   ! Contingency for Normal Mode Path Integral MD or Centroid MD {{{
+#if defined(MPI) || defined(LES)
     call trans_pos_nmode_to_cart(x, cartpos)
+#else
+    call trans_pos_nmode_to_cart(cartpos)
+#endif
     call force(xx, ix, ih, ipairs, cartpos, f, ener, ener%vir, xx(l96), &
                xx(l97), xx(l98), xx(l99), qsetup, do_list_update,nstep)
 #if defined(MPI) && defined(LES)
@@ -1896,9 +2061,164 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     ! }}}
 
 !------------------------------------------------------------------------------
-    ! This(!) is where the force() routine mainly gets called:
+    ! Determine whether we can reuse cached slow forces from the previous macro step
+    call fires_set_step(nstep)
+    call fires_prepare_if_needed(x, amass, natom)
+
+    ! Always track FIRES mask signature; drop cached slow force if it changes.
+    if (fires == 1) then
+      call fires_mask_signature(sig_local(1), sig_local(2), sig_local(3), counts(1), counts(2), counts(3))
+      if (have_prev_sig) then
+        if (any(sig_local /= sig_prev) .or. any(counts /= counts_prev)) then
+          if (fires_static_mask) then
+            if (master) write(6,'(a,i0,a,i0)') 'FIRES ERROR: Mask changed after freeze. nstep=', nstep, &
+              & ', freeze_on=', fires_freeze_on_nstep
+            call mexit(6, 1)
+          else
+            f_slow_cache_valid = .false.
+            if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
+          end if
+        end if
+      end if
+      sig_prev      = sig_local
+      counts_prev   = counts
+      have_prev_sig = .true.
+    end if
+    fires_restraint_enabled_local = fires_restraint_enabled()
+    fires_restraint_enabled_global = fires_restraint_enabled_local
+#ifdef MPI
+    if (numtasks > 1) then
+      mpi_flag_buf(1) = 0
+      if (fires_restraint_enabled_local) mpi_flag_buf(1) = 1
+      call mpi_allreduce(MPI_IN_PLACE, mpi_flag_buf, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+      fires_restraint_enabled_global = (mpi_flag_buf(1) == 1)
+      mask_flag_local(1) = 0
+      if (fires_restraint_enabled_local) mask_flag_local(1) = 1
+      mask_flag_min(1) = mask_flag_local(1)
+      mask_flag_max(1) = mask_flag_local(1)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+      mask_flag_global(1) = 0
+      if (fires_restraint_enabled_global) mask_flag_global(1) = 1
+      if (fires_debug .and. master) then
+        write(6,'(a,i7,2(a,i2),a,i2)') 'DBG[FIRESTEP]: nstep=', nstep, ' fires_restraint_enabled min/max=', &
+          mask_flag_min(1), '/', mask_flag_max(1), ' global=', mask_flag_global(1)
+      end if
+      if (mask_flag_min(1) /= mask_flag_max(1) .and. master) then
+        write(6,'(a,i7,2(a,i2))') 'FIRES WARN: enablement differed across ranks; promoting global enable via OR. nstep=', &
+          nstep, ' min/max=', mask_flag_min(1), '/', mask_flag_max(1)
+      end if
+      if (fires_debug .and. fires == 1) then
+        call fires_mask_signature(sig_local(1), sig_local(2), sig_local(3), counts(1), counts(2), counts(3))
+        call mpi_allreduce(sig_local, sig_min, 3, MPI_INTEGER8, mpi_min, commsander, ierr)
+        call mpi_allreduce(sig_local, sig_max, 3, MPI_INTEGER8, mpi_max, commsander, ierr)
+        call mpi_allreduce(counts, counts_min, 3, MPI_INTEGER, mpi_min, commsander, ierr)
+        call mpi_allreduce(counts, counts_max, 3, MPI_INTEGER, mpi_max, commsander, ierr)
+        if (master) then
+          write(6,'(a,3(1x,z16.16),a,3(1x,i8))') 'DBG[FIRESIG]: sig(min)=', sig_min(1), sig_min(2), sig_min(3), &
+            ' counts(min)=', counts_min(1), counts_min(2), counts_min(3)
+          write(6,'(a,3(1x,z16.16),a,3(1x,i8))') 'DBG[FIRESIG]: sig(max)=', sig_max(1), sig_max(2), sig_max(3), &
+            ' counts(max)=', counts_max(1), counts_max(2), counts_max(3)
+        end if
+        if (any(sig_min /= sig_max) .or. any(counts_min /= counts_max)) then
+          if (master) write(6,'(a)') 'FIRES ERROR: mask signature mismatch during run.'
+          call mexit(6,1)
+        end if
+      end if
+    end if
+#endif
+
+    do_fires_mts = (fires_restraint_enabled_global .and. mts_n > 1 .and. mts_fires > 0.0d0 .and. ipimd == 0)
+#ifdef MPI
+    if (numtasks > 1) then
+      mask_flag_local(1) = 0
+      if (do_fires_mts) mask_flag_local(1) = 1
+      mask_flag_min(1) = mask_flag_local(1)
+      mask_flag_max(1) = mask_flag_local(1)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+      call mpi_allreduce(MPI_IN_PLACE, mask_flag_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+      if (mask_flag_min(1) /= mask_flag_max(1)) then
+        if (master) write(6,'(a)') 'FIRES ERROR: MTS availability differs across MPI ranks; check FIRES masks.'
+        call mexit(6, 1)
+      end if
+      mpi_flag_buf(1) = 0
+      if (do_fires_mts) mpi_flag_buf(1) = 1
+      call mpi_allreduce(MPI_IN_PLACE, mpi_flag_buf, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+      do_fires_mts = (mpi_flag_buf(1) == 1)
+    end if
+#endif
+
+    ! Invalidate cache if the local partition bounds changed
+    part_changed_local = .false.
+    if (istart3_prev /= -1) then
+      if (istart3 /= istart3_prev .or. iend3 /= iend3_prev) then
+        f_slow_cache_valid = .false.
+        part_changed_local = .true.
+      end if
+    end if
+    istart3_prev = istart3
+    iend3_prev   = iend3
+
+    if (fires_disable_cache) f_slow_cache_valid = .false.
+
+    part_changed_any = part_changed_local
+#ifdef MPI
+    if (numtasks > 1) then
+      call MPI_Allreduce(part_changed_local, part_changed_any, 1, MPI_LOGICAL, MPI_LOR, commsander, ierr)
+    end if
+#endif
+    if (part_changed_any) then
+      f_slow_cache_valid = .false.
+      if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
+    end if
+
+    reuse_intent_local = do_fires_mts .and. f_slow_cache_valid
+    reuse_for_all = reuse_intent_local
+#ifdef MPI
+    if (numtasks > 1) then
+      call MPI_Allreduce(reuse_intent_local, reuse_for_all, 1, MPI_LOGICAL, MPI_LAND, commsander, ierr)
+    end if
+#endif
+
+#ifdef MPI
+    if (fires_debug .and. master) then
+      write(6,'(a,i7,3(a,l1),a,l1,a,i4,a,1pe12.5)') 'DBG[STEP]: nstep=', nstep, &
+        ' do_fires_mts=', do_fires_mts, ' reuse_intent_local=', reuse_intent_local, &
+        ' reuse_for_all=', reuse_for_all, ' f_slow_cache_valid=', f_slow_cache_valid, &
+        ' mts_n=', mts_n, ' dtx_fast=', dtx_fast
+    end if
+#endif
+
+    use_cached_slow_force = reuse_for_all
+
+    ! Always invoke force(); optionally skip slow terms and add cached result
     call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), xx(l97), &
-               xx(l98), xx(l99), qsetup, do_list_update,nstep)
+               xx(l98), xx(l99), qsetup, do_list_update, nstep)
+
+    if (fires == 1 .and. mts_n > 1) then
+      if (fires_in_force .and. .not. fires_force_warned .and. master) then
+        write(6,'(a)') 'FIRES WARN: force() included FIRES while MTS is enabled; subtracting in slow half-kick.'
+        fires_force_warned = .true.
+      end if
+    end if
+
+    if (use_cached_slow_force) then
+      if (allocated(f_slow_cache)) then
+        f(1:nr3) = f_slow_cache(1:nr3)
+      end if
+    else
+      if (.not. allocated(f_slow_cache)) then
+        allocate(f_slow_cache(nr3))
+        f_slow_cache = 0.0d0
+      end if
+      if (do_fires_mts) then
+        f_slow_cache(1:nr3) = f(1:nr3)
+        f_slow_cache_valid  = .true.
+      else
+        f_slow_cache_valid = .false.
+        f_slow_cache = 0.0d0
+      end if
+    end if
 
 !---------- BEGIN FIRES MTS ---------------------------------------------------
 
@@ -1909,60 +2229,133 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   ! basic case: (gammai == 0), no constraints (ntc == 1), no PIMD (ipimd == 0). Otherwise fall back to standard path :
   ! base case: if (fires == 1 .and. mts_n > 1 .and. mts_fires > 0.0d0 .and. gammai == 0.d0 .and. ntc == 1 .and. ipimd == 0 .and. ntt == 0 .and. ibelly == 0) then
   ! Safety net to prevent bad setups
-  if (fires == 1 .and. mts_n > 1 .and. mts_fires > 0.0d0 .and. gammai == 0.d0  .and. ntt == 0 .and. ibelly == 0) then
+  ! Allow MTS even when Langevin (gammai>0) or SHAKE (ntc>1) are active; handle them inside the subcycling loop.
+  if (do_fires_mts) then
+
+      saved_fires_band_filter_enabled = fires_band_filter_enabled
+      efires_report = 0.0d0
 
       call timer_start(TIME_VERLET)
+
+      mts_n_local = mts_n
+#ifdef MPI
+      mts_n_min(1) = mts_n_local
+      mts_n_max(1) = mts_n_local
+      if (numtasks > 1) then
+        call mpi_allreduce(MPI_IN_PLACE, mts_n_min, 1, MPI_INTEGER, mpi_min, commsander, ierr)
+        call mpi_allreduce(MPI_IN_PLACE, mts_n_max, 1, MPI_INTEGER, mpi_max, commsander, ierr)
+        if (mts_n_min(1) .ne. mts_n_max(1)) then
+          if (master) write(6,'(a,i8,a,i8)') 'FIRES ERROR: mts_n diverged across ranks: ', mts_n_min(1), ' vs ', mts_n_max(1)
+          call mexit(6, 1)
+        end if
+        mts_n = mts_n_min(1)
+      else
+        mts_n = mts_n_local
+      end if
+#else
+      mts_n = mts_n_local
+#endif
 
       xold(istart3:iend3) = x(istart3:iend3)
       
   ! Allocate temporaries for local degrees of freedom
-      allocate(f_slow(nr3))
-      f_slow = 0.d0
-      allocate(f_fires_curr(nr3))
-      f_fires_curr = 0.d0
+  allocate(f_slow(nr3))
+  f_slow = 0.d0
+  ! Allocate FIRES accumulator to global length because indexing below
+  ! uses global offsets (a = 3*atom_index-2). Using local-length caused
+  ! out-of-bounds accesses under MPI with domain decomposition.
+  allocate(f_fires_curr(3*natom))
 
-      ! Compute initial FIRES force; note: force() does NOT include FIRES,
-      ! so the slow force is just the current total f from force().
-      f_fires_curr(1:nr3) = 0.d0
-      call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
+  ! Compute initial FIRES force; note: force() does NOT include FIRES,
+  ! so the slow force is just the current total f from force().
+  ! Zero only the local slice before calling fires_force so only the
+  ! local triplets are cleared when using domain decomposition.
+  f_fires_curr(istart3:iend3) = 0.d0
+  call fires_set_local_bounds(istart3, iend3)
+  efires_tmp = 0.0d0
+  call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
       
       ! Check if FIRES is actually active - if all forces are tiny, skip MTS
       fires_magnitude = 0.0d0
-      do i3 = 1, nr3
+      do i3 = istart3, iend3
         fires_magnitude = fires_magnitude + f_fires_curr(i3)*f_fires_curr(i3)
       end do
+
+    ! JOSE MOD (MPI sync): Make the "skip MTS" decision consistent across ranks
+      early_exit_local = .false.
+#ifdef MPI
+      if (numtasks > 1) then
+        if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce fires_magnitude nstep=', nstep, ' sub=0'
+        fires_magnitude_buf(1) = fires_magnitude
+        call mpi_allreduce(MPI_IN_PLACE, fires_magnitude_buf, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+        fires_magnitude = fires_magnitude_buf(1)
+        if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce fires_magnitude nstep=', nstep, ' sub=0 value=', fires_magnitude
+      end if
+#endif
+      early_exit_global = (fires_magnitude < 1.0d-12)
+      early_exit_local = early_exit_global
       
-      if (fires_magnitude < 1.0d-12) then
-         ! FIRES is essentially zero - just use standard integration
-         if (master) then
-            write(6,'(a)') '| JOSE: FIRES forces negligible, using standard integration'
+    if (early_exit_global) then
+        ! FIRES is essentially zero - just use standard integration
+        fires_band_filter_enabled = saved_fires_band_filter_enabled
+        skip_force_refresh = .false.
+        f_slow_cache_valid = .false.
+        if (allocated(f_slow_cache)) f_slow_cache = 0.0d0
+        
+        ! Record FIRES restraint energy so reported totals include subcycled work
+#ifdef MPI
+        if (numtasks > 1) then
+           if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce efires_tmp nstep=', nstep, ' sub=0'
+           efires_tmp_buf(1) = efires_tmp
+           call mpi_allreduce(MPI_IN_PLACE, efires_tmp_buf, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+           efires_tmp = efires_tmp_buf(1)
+           if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce efires_tmp nstep=', nstep, ' sub=0 value=', efires_tmp
+        end if
+#endif
+        efires_report = efires_tmp
+
+        deallocate(f_slow)
+        deallocate(f_fires_curr)
+
+         ! Refresh slow-force energies so totals reflect final coordinates
+         call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), &
+                    xx(l97), xx(l98), xx(l99), qsetup, do_list_update, nstep)
+
+         ener%pot%constraint = ener%pot%constraint + efires_report
+         ener%pot%tot        = ener%pot%tot        + efires_report
+         if (ipimd > 0) then
+            totener%pot%constraint = totener%pot%constraint + efires_report
+            totener%pot%tot        = totener%pot%tot        + efires_report
          end if
-         
-         deallocate(f_slow)
-         deallocate(f_fires_curr)
 
          call timer_stop(TIME_VERLET)
          ! Fall through to standard integration
       else
          ! FIRES is active - proceed with MTS
-         ! Slow force equals the current total force from force() (FIRES not included)
-         do i3 = 1, nr3
-            f_slow(i3) = f(i3) ! tjg: are you sure fires is not included? force() includes it....
-         end do
+         ! Start from the total force returned by force(); strip FIRES if it was already applied there
+         f_slow(1:nr3) = f(1:nr3)
+         if (fires_in_force) then
+            do i3 = istart3, iend3
+               f_slow(i3) = f_slow(i3) - f_fires_curr(i3)
+            end do
+         end if
          
-         ! Inner step size: mts_fires (ps) converted to internal units like dt
+      ! Inner step size: mts_fires (ps) converted to internal units like dt
          ! Ensure consistency so that mts_n * dtx_fast == dtx to avoid drift/instability.
          dtx_fast = dble(mts_fires) * 20.455d0
          if (abs(dtx - dtx_fast*dble(mts_n)) > 1.0d-12) then
-            if (master) then
-               write(6,'(a,1p,3e16.7)') '| JOSE: dt != mts_n*mts_fires; dt, user_dt_fast, mts_n*user_dt_fast =', dtx, dtx_fast, dtx_fast*dble(mts_n)
-            end if
             ! Force-consistent microstep so inner subcycling spans exactly dt
             dtx_fast = dtx / dble(mts_n)
-            if (master) then
-               write(6,'(a,1p,e16.7)') '| JOSE: Adjusting fast-step: new_dt_fast = dt/mts_n =', dtx_fast
-            end if
          end if
+
+      ! Fast-step Langevin parameters (if gammai>0): mirror main-step definitions but using dtx_fast
+      dt5_fast     = 0.5d0 * dtx_fast
+      c_implic_fast = 1.d0 / (1.d0 + gammai*dt5_fast)
+      c_explic_fast = 1.d0 - gammai*dt5_fast
+      sdfac_fast    = sqrt(4.d0 * gammai * boltz2 * temp0 / dtx_fast)
+#ifdef LES
+      sdfacles_fast = sqrt(4.d0 * gammai * boltz2 * temp0les / dtx_fast)
+#endif
          
          ! JOSE (MTS): Slow force half-kick (RESPA style): apply half of the slow update now,
          ! accumulate the other half after the fast subcycling completes.
@@ -1976,15 +2369,21 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
             i3 = i3 + 3
          end do
          
-         do sub = 1, mts_n
+         ! Ensure FIRES band filter remains disabled during MTS subcycling
+         fires_band_filter_enabled = .false.
+
+        do sub = 1, mts_n
+          if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: microstep enter nstep=', nstep, ' sub=', sub
             
             ! JOSE (MTS): Velocity-Verlet for fast force only
-            ! 1) compute FIRES on current positions
+            !compute FIRES on current positions
             
-            f_fires_curr(1:nr3) = 0.d0
-            call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
+  ! Zero only the local slice before recomputing FIRES
+  f_fires_curr(istart3:iend3) = 0.d0
+  call fires_set_local_bounds(istart3, iend3)
+  call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
 
-            ! 2) first half-kick with FIRES
+            !first half-kick with FIRES
             i3 = 3*(istart - 1)
             do j = istart, iend
                wfac = winv(j) * (0.5d0 * dtx_fast)
@@ -1996,16 +2395,166 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
             !call corpac(x, 1, nrx, MDCRD_UNIT, loutfm)
             
-            ! 3) drift positions by full dtx_fast
+        !   drift positions by full dtx_fast
             do i3 = istart3, iend3
                !f(i3) = x(i3)                   ! store old position
                x(i3) = x(i3) + v(i3) * dtx_fast
             end do
 
-            ! 4) recompute FIRES on new positions
-            f_fires_curr(1:nr3) = 0.d0
-            call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
+        ! If SHAKE constraints are active, enforce them after the drift
+            if (ntc > 1) then
+              call timer_start(TIME_SHAKE)
+              call shake(nrp, nbonh, nbona, 0, ix(iibh), ix(ijbh), ix(ibellygp), &
+                         winv, conp, skip, x, v, nitp, belly, ix(iifstwt), ix(noshake), qspatial)
+              call timer_stop(TIME_SHAKE)
+            end if
+
+        ! recompute FIRES on new positions
+  ! Zero only the local slice before recomputing FIRES
+  f_fires_curr(istart3:iend3) = 0.d0
+  call fires_set_local_bounds(istart3, iend3)
+  call fires_force(x, amass, natom, f_fires_curr, efires_tmp)
             
+        ! Early-exit: if this is the first substep and FIRES is effectively zero,
+        ! we can stop subcycling. Finish the remaining time as a single drift
+        ! (no FIRES), apply SHAKE once if needed, and apply the Langevin update
+        ! over the remaining interval so that total dt is preserved.
+        if (sub == 1) then
+          fires_magnitude = 0.0d0
+          do i3 = istart3, iend3
+            fires_magnitude = fires_magnitude + f_fires_curr(i3)*f_fires_curr(i3)
+          end do
+          ! JOSE MOD (MPI sync): Early-exit decision must be rank-consistent
+          early_exit_local = .false.
+#ifdef MPI
+          if (numtasks > 1) then
+            if (fires_debug .and. master) write(6,'(a,i7,a,i4)') 'DBG[MTS]: entering reduce fires_magnitude nstep=', nstep, ' sub=', sub
+            fires_magnitude_buf(1) = fires_magnitude
+            call mpi_allreduce(MPI_IN_PLACE, fires_magnitude_buf, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+            fires_magnitude = fires_magnitude_buf(1)
+            if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,1pe12.5)') 'DBG[MTS]: exit reduce fires_magnitude nstep=', nstep, ' sub=', sub, ' value=', fires_magnitude
+            maxabs = 0.0d0
+            nanflag = 0
+            infflag = 0
+            do i3 = istart3, iend3
+              if (v(i3) .ne. v(i3)) nanflag = 1
+              if (abs(v(i3)) > huge(1.0d0)) infflag = 1
+              if (abs(v(i3)) > maxabs) maxabs = abs(v(i3))
+            end do
+            maxabs_buf(1) = maxabs
+            call mpi_allreduce(MPI_IN_PLACE, maxabs_buf, 1, MPI_DOUBLE_PRECISION, mpi_max, commsander, ierr)
+            nanflag_buf(1) = nanflag
+            call mpi_allreduce(MPI_IN_PLACE, nanflag_buf, 1, MPI_INTEGER, mpi_sum, commsander, ierr)
+            infflag_buf(1) = infflag
+            call mpi_allreduce(MPI_IN_PLACE, infflag_buf, 1, MPI_INTEGER, mpi_sum, commsander, ierr)
+            if (fires_debug .and. master) then
+              write(6,'(a,i7,a,i4,a,1pe12.5,2(a,i4))') 'DBG[MTS]: sentinels nstep=', nstep, ' sub=', sub, &
+                ' max|v|=', maxabs_buf(1), ' nNaN=', nanflag_buf(1), ' nInf=', infflag_buf(1)
+            end if
+          end if
+#endif
+          early_exit_global = (fires_magnitude < 1.0d-12)
+          early_exit_local = early_exit_global
+#ifdef MPI
+          if (fires_debug .and. master) write(6,'(a,i7,a,i4,a,l1)') 'DBG[MTS]: early-exit decision nstep=', nstep, ' sub=', sub, ' value=', early_exit_global
+#endif
+          if (early_exit_global) then
+            ! Complete first microstep's second half-kick (forces ~0) and Langevin
+            i3 = 3*(istart - 1)
+            do j = istart, iend
+              wfac = winv(j) * (0.5d0 * dtx_fast)
+              !wfac = winv(j) * (dtx_fast)
+              v(i3+1) = v(i3+1) + f_fires_curr(i3+1) * wfac
+              v(i3+2) = v(i3+2) + f_fires_curr(i3+2) * wfac
+              v(i3+3) = v(i3+3) + f_fires_curr(i3+3) * wfac
+              i3 = i3 + 3
+            end do
+            ! Make the inner loop determinstic ?!
+!            if (gammai > 0.d0) then
+!              i3 = 3*(istart - 1)
+!              do j = istart, iend
+!                wfac = winv(j) * dtx_fast
+!                aamass = amass(j)
+!#ifdef LES
+!                if (temp0les >= 0 .and. temp0 .ne. temp0les .and. cnum(j) .ne. 0) then
+!                  rsd = sdfacles_fast * sqrt(aamass)
+!                else
+!                  rsd = sdfac_fast * sqrt(aamass)
+!                endif
+!#else
+!                rsd = sdfac_fast * sqrt(aamass)
+!#endif /* LES */
+!                call gauss(0.d0, rsd, fln)
+!                v(i3+1) = (v(i3+1)*c_explic_fast + fln*wfac) * c_implic_fast
+!                call gauss(0.d0, rsd, fln)
+!                v(i3+2) = (v(i3+2)*c_explic_fast + fln*wfac) * c_implic_fast
+!                call gauss(0.d0, rsd, fln)
+!                v(i3+3) = (v(i3+3)*c_explic_fast + fln*wfac) * c_implic_fast
+!                i3 = i3 + 3
+!              end do
+              if (ibelly > 0) then
+                call bellyf(nr, ix(ibellygp), v)
+              end if
+!            end if
+
+            ! Remaining time for this macro step (collapse rest into one update)
+            dtx_rest = dtx - dtx_fast
+            if (dtx_rest > 0.d0) then
+              ! Drift for the remaining interval without FIRES
+              do i3 = istart3, iend3
+                x(i3) = x(i3) + v(i3) * dtx_rest
+              end do
+              ! Enforce SHAKE once at end of the drift, if active
+              if (ntc > 1) then
+                call timer_start(TIME_SHAKE)
+                call shake(nrp, nbonh, nbona, 0, ix(iibh), ix(ijbh), ix(ibellygp), &
+                        winv, conp, skip, x, v, nitp, belly, ix(iifstwt), ix(noshake), qspatial)
+                call timer_stop(TIME_SHAKE)
+              end if
+              ! Then correct velocities with RATTLE (always for constrained runs)
+              if (ntc > 1) then
+                qspatial = .false.
+                call rattlev(nrp,nbonh,nbona,0,ix(iibh),ix(ijbh),ix(ibellygp), &
+                     winv,conp,skip,x,v,nitp,belly,ix(iifstwt),ix(noshake), qspatial)
+                call quick3v(x, v, ix(iifstwr), natom, nres, ix(i02))
+              end if
+              ! Apply Langevin over the remaining interval as one step
+              if (gammai > 0.d0) then
+                dt5_rest      = 0.5d0 * dtx_rest
+                c_implic_rest = 1.d0 / (1.d0 + gammai*dt5_rest)
+                c_explic_rest = 1.d0 - gammai*dt5_rest
+                i3 = 3*(istart - 1)
+                do j = istart, iend
+                  wfac = winv(j) * dtx_rest
+                  aamass = amass(j)
+#ifdef LES
+                  if (temp0les >= 0 .and. temp0 .ne. temp0les .and. cnum(j) .ne. 0) then
+                    rsd = sqrt(4.d0 * gammai * boltz2 * temp0les / dtx_rest) * sqrt(aamass)
+                  else
+                    rsd = sqrt(4.d0 * gammai * boltz2 * temp0 / dtx_rest) * sqrt(aamass)
+                  endif
+#else
+                  rsd = sqrt(4.d0 * gammai * boltz2 * temp0 / dtx_rest) * sqrt(aamass)
+#endif /* LES */
+                  call gauss(0.d0, rsd, fln)
+                  v(i3+1) = (v(i3+1)*c_explic_rest + fln*wfac) * c_implic_rest
+                  call gauss(0.d0, rsd, fln)
+                  v(i3+2) = (v(i3+2)*c_explic_rest + fln*wfac) * c_implic_rest
+                  call gauss(0.d0, rsd, fln)
+                  v(i3+3) = (v(i3+3)*c_explic_rest + fln*wfac) * c_implic_rest
+                  i3 = i3 + 3
+                end do
+                if (ibelly > 0) then
+                  call bellyf(nr, ix(ibellygp), v)
+                end if
+              end if
+            end if
+
+            ! Break out of microstep loop; we'll do the slow second half-kick next
+            exit
+          end if
+        end if
+
             ! 5) second half-kick with NEW FIRES
             i3 = 3*(istart - 1)
             do j = istart, iend
@@ -2015,49 +2564,97 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
                v(i3+3) = v(i3+3) + f_fires_curr(i3+3) * wfac
                i3 = i3 + 3
             end do
-         end do
-         
-         ! JOSE (MTS): Recompute slow force at end positions and apply second half-kick
-         call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), xx(l97), &
-              xx(l98), xx(l99), qsetup, do_list_update, nstep)
-         ! f now holds the up-to-date (slow) force at end of the outer step
-         i3 = 3*(istart - 1)
-         do j = istart, iend
-            wfac = winv(j) * (0.5d0 * dtx)
-            v(i3+1) = v(i3+1) + f(i3+1) * wfac
-            v(i3+2) = v(i3+2) + f(i3+2) * wfac
-            v(i3+3) = v(i3+3) + f(i3+3) * wfac
-            i3 = i3 + 3
-         end do
-         
-         ! At end, set f to the latest total force (slow_end + FIRES at end)
-         do i3 = 1, nr3
-            f(i3) = f(i3) + f_fires_curr(i3) ! tjg: doesn't this include fires twice?  force() includes fires
-         end do
-         
-         ! Consider vlimit (cap velocities) since we skip the standard path below
-         if (vlim .and. ipimd == 0) then
-            vmax = 0.0d0
-            do i3 = 1, 3*natom
-               vmax = max(vmax, abs(v(i3)))
-               v(i3) = sign(min(abs(v(i3)), vlimit), v(i3))
-            end do
-            if (vmax > vlimit) then
-               if (master) then
-                  write(6,'(a,i6,a,f10.4)') 'vlimit exceeded for step ', nstep, &
-                       '; vmax = ', vmax
-               end if
+
+            ! 6) Langevin thermostat per microstep DISABLED per request
+            ! if (gammai > 0.d0) then
+            !   i3 = 3*(istart - 1)
+            !   do j = istart, iend
+            !     wfac = winv(j) * dtx_fast
+            !     aamass = amass(j)
+            ! #ifdef LES
+            !     if (temp0les >= 0 .and. temp0 .ne. temp0les .and. cnum(j) .ne. 0) then
+            !       rsd = sdfacles_fast * sqrt(aamass)
+            !     else
+            !       rsd = sdfac_fast * sqrt(aamass)
+            !     endif
+            ! #else
+            !     rsd = sdfac_fast * sqrt(aamass)
+            ! #endif /* LES */
+            !     call gauss(0.d0, rsd, fln)
+            !     v(i3+1) = (v(i3+1)*c_explic_fast + fln*wfac) * c_implic_fast
+            !     call gauss(0.d0, rsd, fln)
+            !     v(i3+2) = (v(i3+2)*c_explic_fast + fln*wfac) * c_implic_fast
+            !     call gauss(0.d0, rsd, fln)
+            !     v(i3+3) = (v(i3+3)*c_explic_fast + fln*wfac) * c_implic_fast
+            !     i3 = i3 + 3
+            !   end do
+            !   if (ibelly > 0) then
+            !      call bellyf(nr, ix(ibellygp), v)
+            !   end if
+            ! end if
+
+            ! RATTLE velocities (constrained velocities correction)
+            if (ntc > 1) then
+              qspatial = .false.
+              call rattlev(nrp,nbonh,nbona,0,ix(iibh),ix(ijbh),ix(ibellygp), &
+                   winv,conp,skip,x,v,nitp,belly,ix(iifstwt),ix(noshake), qspatial)
+              ! use SETTLE to deal with water model
+              call quick3v(x, v, ix(iifstwr), natom, nres, ix(i02))
             end if
-         end if
-         
-         deallocate(f_slow)
-         deallocate(f_fires_curr)
+         end do
+         if (fires_debug .and. master) write(6,'(a,i7)') 'DBG[MTS]: microsteps complete nstep=', nstep
+
+        ! Restore FIRES band filter state after MTS subcycling completes
+        fires_band_filter_enabled = saved_fires_band_filter_enabled
+        
+      ! Recompute the slow forces at x(t+dt) (FIRES excluded when mts_n>1)
+      call force(xx, ix, ih, ipairs, x, f, ener, ener%vir, xx(l96), &
+                 xx(l97), xx(l98), xx(l99), qsetup, do_list_update, nstep)
+      if (.not. allocated(f_slow_cache)) then
+        allocate(f_slow_cache(nr3))
+      end if
+      f_slow_cache(1:nr3) = f(1:nr3)
+      f_slow_cache_valid  = .true.
+
+      ! Closing slow half-kick using the refreshed slow force
+      i3 = 3*(istart - 1)
+      do j = istart, iend
+        wfac = winv(j) * (0.5d0 * dtx)
+        v(i3+1) = v(i3+1) + f(i3+1) * wfac
+        v(i3+2) = v(i3+2) + f(i3+2) * wfac
+        v(i3+3) = v(i3+3) + f(i3+3) * wfac
+        i3 = i3 + 3
+      end do
+
+      ! Capture FIRES energy from the final microstep and refresh slow-energy bookkeeping
+#ifdef MPI
+      if (numtasks > 1) then
+         if (fires_debug .and. master) write(6,'(a,i7)') 'DBG[MTS]: entering reduce efires_tmp (final) nstep=', nstep
+         efires_tmp_buf(1) = efires_tmp
+         call mpi_allreduce(MPI_IN_PLACE, efires_tmp_buf, 1, MPI_DOUBLE_PRECISION, mpi_sum, commsander, ierr)
+         efires_tmp = efires_tmp_buf(1)
+         if (fires_debug .and. master) write(6,'(a,i7,a,1pe12.5)') 'DBG[MTS]: exit reduce efires_tmp (final) nstep=', nstep, ' val=', efires_tmp
+      end if
+#endif
+      efires_report = efires_tmp
+      ener%pot%constraint = ener%pot%constraint + efires_report
+      ener%pot%tot        = ener%pot%tot        + efires_report
+      if (ipimd > 0) then
+         totener%pot%constraint = totener%pot%constraint + efires_report
+         totener%pot%tot        = totener%pot%tot        + efires_report
+      end if
+
+        ! Skip velocity capping inside FIRES; vlimit handled in the standard path
+
+        deallocate(f_slow)
+        deallocate(f_fires_curr)
 
          call timer_stop(TIME_VERLET)
          ! Skip the standard velocity/position update path
 
-         f(istart3:iend3) = xold(istart3:iend3)
-         goto 9990
+        update_kin_energy_on_current_step = .true.
+        skip_outer_shake = .true.
+        skip_standard_position_update = .true.
       end if
     end if
     
@@ -2144,13 +2741,17 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 !------------------------------------------------------------------------------
   ! If softcore potentials are used, collect their dvdl contributions: {{{
   if (ifsc .ne. 0) then
-    call mpi_reduce(sc_dvdl, sc_tot_dvdl, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+    sc_dvdl_buf(1) = sc_dvdl
+    call mpi_reduce(sc_dvdl_buf, sc_tot_dvdl_buf, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
                     0, commsander, ierr)
+    if (master) sc_tot_dvdl = sc_tot_dvdl_buf(1)
     sc_dvdl=0.0d0 ! zero for next step
-    call mpi_reduce(sc_dvdl_ee, sc_tot_dvdl_ee, 1, MPI_DOUBLE_PRECISION, &
+    sc_dvdl_ee_buf(1) = sc_dvdl_ee
+    call mpi_reduce(sc_dvdl_ee_buf, sc_tot_dvdl_ee_buf, 1, MPI_DOUBLE_PRECISION, &
                     MPI_SUM, 0, commsander, ierr)
+    if (master) sc_tot_dvdl_ee = sc_tot_dvdl_ee_buf(1)
     sc_dvdl_ee = 0.0d0 ! zero for next step
-    call mpi_reduce(sc_ener, sc_ener_tmp, ti_ene_cnt, MPI_DOUBLE_PRECISION, &
+    call mpi_reduce(sc_ener(:), sc_ener_tmp(:), ti_ene_cnt, MPI_DOUBLE_PRECISION, &
                     MPI_SUM, 0, commsander, ierr)
     sc_ener(1:ti_ene_cnt) = sc_ener_tmp(1:ti_ene_cnt)
   end if
@@ -2185,12 +2786,18 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
                         partner, 5, commmaster, ist, ierr)
 
       ! Exchange sc-dvdl contributions between masters:
-      call mpi_sendrecv(sc_tot_dvdl, 1, MPI_DOUBLE_PRECISION, partner, 5, &
-                        sc_tot_dvdl_partner, 1, MPI_DOUBLE_PRECISION, &
+      sc_tot_dvdl_buf(1) = sc_tot_dvdl
+      sc_tot_dvdl_partner_buf(1) = sc_tot_dvdl_partner
+      call mpi_sendrecv(sc_tot_dvdl_buf, 1, MPI_DOUBLE_PRECISION, partner, 5, &
+                        sc_tot_dvdl_partner_buf, 1, MPI_DOUBLE_PRECISION, &
                         partner, 5, commmaster, ist, ierr)
-      call mpi_sendrecv(sc_tot_dvdl_ee, 1, MPI_DOUBLE_PRECISION, partner, 5, &
-                        sc_tot_dvdl_partner_ee, 1, MPI_DOUBLE_PRECISION, &
+      sc_tot_dvdl_partner = sc_tot_dvdl_partner_buf(1)
+      sc_tot_dvdl_ee_buf(1) = sc_tot_dvdl_ee
+      sc_tot_dvdl_partner_ee_buf(1) = sc_tot_dvdl_partner_ee
+      call mpi_sendrecv(sc_tot_dvdl_ee_buf, 1, MPI_DOUBLE_PRECISION, partner, 5, &
+                        sc_tot_dvdl_partner_ee_buf, 1, MPI_DOUBLE_PRECISION, &
                         partner, 5, commmaster, ist, ierr )
+      sc_tot_dvdl_partner_ee = sc_tot_dvdl_partner_ee_buf(1)
 
       ! Collect statistics for free energy calculations
       if (onstep) then
@@ -2310,13 +2917,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       call mpi_allreduce(MPI_IN_PLACE, atomvir, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
 #  else
-      call mpi_allreduce(centvir, mpitmp, 1, MPI_DOUBLE_PRECISION, &
+      mpitmp(1) = centvir
+      call mpi_allreduce(mpitmp, mpitmp_recv, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
-      centvir = mpitmp(1)
-      tmp = 0.0
-      call mpi_allreduce(atomvir, tmp, 1, MPI_DOUBLE_PRECISION, &
+      centvir = mpitmp_recv(1)
+      mpitmp(1) = atomvir
+      call mpi_allreduce(mpitmp, mpitmp_recv, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
-      atomvir=tmp
+      atomvir = mpitmp_recv(1)
 #  endif /* USE_MPI_IN_PLACE */
 #endif /* MPI */
     else
@@ -2329,20 +2937,22 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       call mpi_allreduce(MPI_IN_PLACE, e14vir, 9, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
 #    ifndef LES
-      if (master) &
+      if (commmaster /= MPI_COMM_NULL) then
         call mpi_allreduce(MPI_IN_PLACE, atvir, 9, MPI_DOUBLE_PRECISION, &
                            mpi_sum, commmaster, ierr)
+      end if
 #    endif /* LES */
 #  else
-      call mpi_allreduce(centvir, tmp, 1, MPI_DOUBLE_PRECISION, &
+      mpitmp(1) = centvir
+      call mpi_allreduce(mpitmp, mpitmp_recv, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
-      centvir = tmp
+      centvir = mpitmp_recv(1)
       tmpvir = 0.0
       call mpi_allreduce(bnd_vir, tmpvir, 9, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
       bnd_vir = tmpvir
 #    ifndef LES
-      if (master) then
+      if (commmaster /= MPI_COMM_NULL) then
         tmpvir = 0.0
         call mpi_allreduce(e14vir, tmpvir, 9, MPI_DOUBLE_PRECISION, &
                            mpi_sum, commmaster, ierr)
@@ -2677,8 +3287,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
                     MPI_DOUBLE_PRECISION, 0, commsander, ierr);
 
     ! Summing up over all processors and sending the result to the master root
-    call mpi_reduce(clfs, sclfs, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
+    clfs_buf(1) = clfs
+    call mpi_reduce(clfs_buf, sclfs_buf, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
                     commsander, ierr)
+    if (master) sclfs = sclfs_buf(1)
     if (master) then
       davalevs = 0.d0
       do inum = 1, numtasks
@@ -2726,8 +3338,16 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
         ! Summing up the partial terms over all processors and
         ! sending the result to all
-        call mpi_allreduce(txtr, stxtr, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+        txtr_buf(1) = txtr
+#  ifdef USE_MPI_IN_PLACE
+        stxtr_buf(1) = txtr_buf(1)
+        call mpi_allreduce(MPI_IN_PLACE, stxtr_buf, 1, MPI_DOUBLE_PRECISION, &
+                           MPI_SUM, commsander, ierr)
+#  else
+        call mpi_allreduce(txtr_buf, stxtr_buf, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
                            commsander, ierr)
+#  endif
+        stxtr = stxtr_buf(1)
         txtr = stxtr / (natom * 3.d0)
 #else
         txtr = txtr / (natom * 3.d0)
@@ -2787,14 +3407,14 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
 #ifdef MPI
     ! Summing up over all processors and sending the results to the master root
-    call mpi_reduce(distrs, sdistrs, 2*lep+1, MPI_DOUBLE_PRECISION, MPI_SUM, &
-                    0, commsander, ierr)
-    call mpi_reduce(distrh1, sdistrh1, lep, MPI_DOUBLE_PRECISION, MPI_SUM, &
-                    0, commsander, ierr)
-    call mpi_reduce(distrh2, sdistrh2, 2*lep+1, MPI_DOUBLE_PRECISION, &
+    call mpi_reduce(distrs(-lep:lep), sdistrs(-lep:lep), 2*lep+1, &
+                    MPI_DOUBLE_PRECISION, MPI_SUM, 0, commsander, ierr)
+    call mpi_reduce(distrh1(1:lep), sdistrh1(1:lep), lep, MPI_DOUBLE_PRECISION, &
                     MPI_SUM, 0, commsander, ierr)
-    call mpi_reduce(distrh3, sdistrh3, 2*lep+1, MPI_DOUBLE_PRECISION, &
-                    MPI_SUM, 0, commsander, ierr)
+    call mpi_reduce(distrh2(-lep:lep), sdistrh2(-lep:lep), 2*lep+1, &
+                    MPI_DOUBLE_PRECISION, MPI_SUM, 0, commsander, ierr)
+    call mpi_reduce(distrh3(-lep:lep), sdistrh3(-lep:lep), 2*lep+1, &
+                    MPI_DOUBLE_PRECISION, MPI_SUM, 0, commsander, ierr)
 
     ! Writing the results only once using the master processor
     if (master) then
@@ -2873,16 +3493,16 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         s3a(j) = s3(j)
       end do
       svs = 0.d0
-      call mpi_reduce(sv, svs, 3*natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
+      call mpi_reduce(sv(:), svs(:), 3*natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
                       commsander, ierr)
       s1s = 0.d0
       s2s = 0.d0
       s3s = 0.d0
-      call mpi_reduce(s1a, s1s, natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
+      call mpi_reduce(s1a(:), s1s(:), natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
                       commsander, ierr)
-      call mpi_reduce(s2a, s2s, natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
+      call mpi_reduce(s2a(:), s2s(:), natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
                       commsander, ierr)
-      call mpi_reduce(s3a, s3s, natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
+      call mpi_reduce(s3a(:), s3s(:), natom, MPI_DOUBLE_PRECISION, MPI_SUM, 0, &
                       commsander, ierr)
       if (master) then
         open(578, file='vfreez.rst')
@@ -2957,14 +3577,16 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     end do
     if (ntp > 0 .and. ipimd == NMPIMD) then
 #ifdef MPI
+      mpitmp(1) = Ekin2_tot
 #  ifdef USE_MPI_IN_PLACE
-      call mpi_allreduce(MPI_IN_PLACE, Ekin2_tot, 1, MPI_DOUBLE_PRECISION, &
+      call mpi_allreduce(MPI_IN_PLACE, mpitmp, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
 #  else
-      call mpi_allreduce(Ekin2_tot, mpitmp, 1, MPI_DOUBLE_PRECISION, &
+      call mpi_allreduce(mpitmp, mpitmp_recv, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
-      Ekin2_tot = mpitmp(1)
+      mpitmp(1) = mpitmp_recv(1)
 #  endif /* USE_MPI_IN_PLACE */
+      Ekin2_tot = mpitmp(1)
 #endif /* MPI */
       f_lnv_v = Ekin2_tot*(c2_lnv - 1)
       tmp = exp(-dt5 * thermo_lnv%v(1))
@@ -3000,14 +3622,16 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     end do
     if (ntp > 0 .and. ipimd == NMPIMD) then
 #ifdef MPI
+      mpitmp(1) = Ekin2_tot
 #  ifdef USE_MPI_IN_PLACE
-      call mpi_allreduce(MPI_IN_PLACE, Ekin2_tot, 1, MPI_DOUBLE_PRECISION, &
+      call mpi_allreduce(MPI_IN_PLACE, mpitmp, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
 #  else
-      call mpi_allreduce(Ekin2_tot, mpitmp, 1, MPI_DOUBLE_PRECISION, &
+      call mpi_allreduce(mpitmp, mpitmp_recv, 1, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commworld, ierr)
-      Ekin2_tot = mpitmp(1)
+      mpitmp(1) = mpitmp_recv(1)
 #  endif /* USE_MPI_IN_PLACE */
+      Ekin2_tot = mpitmp(1)
 #endif /* MPI */
       f_lnv_v = Ekin2_tot*(c2_lnv - 1)
     end if
@@ -3063,17 +3687,37 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     sdfacles = sqrt(4.d0 * gammai * boltz2 * temp0les / dtx)
 #endif /* LES */
 
+    skip_langevin_update = .false.
 #ifdef MPI /* SOFT CORE */
     if (ifsc == 1) then
-      call sc_lngdyn(winv, amass, v, f, sdfac, c_explic, c_implic, &
-                     istart, iend, nr, dtx)
+      if (do_fires_mts) then
+        if (allocated(f_langevin_zero)) then
+          if (size(f_langevin_zero) /= nr3) then
+            deallocate(f_langevin_zero)
+          end if
+        end if
+        if (.not. allocated(f_langevin_zero)) then
+          allocate(f_langevin_zero(nr3))
+        end if
+        f_langevin_zero(1:nr3) = 0.0d0
+        call sc_lngdyn(winv, amass, v, f_langevin_zero, sdfac, c_explic, c_implic, &
+                       istart, iend, nr, dtx)
+      else
+        call sc_lngdyn(winv, amass, v, f, sdfac, c_explic, c_implic, &
+                       istart, iend, nr, dtx)
+      end if
       if (ibelly > 0) then
          call bellyf_softcore(v,vold,istart,iend)
          call bellyf(nr,ix(ibellygp),v)
       end if
-    else
+      skip_langevin_update = .true.
+    end if
 #endif
-    if (no_ntt3_sync == 1) then
+
+    if (.not. skip_langevin_update) then
+      f_det_scale = 1.0d0
+      if (do_fires_mts) f_det_scale = 0.0d0
+      if (no_ntt3_sync == 1) then
 
       ! We don't worry about synchronizing the random number stream
       ! across processors.
@@ -3116,11 +3760,11 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         rsd = sdfac*sqrt(aamass)
 #endif /* LES */
         call gauss(0.d0, rsd, fln)
-        v(i3+1) = (v(i3+1)*c_explic + (f(i3+1)+fln)*wfac) * c_implic
+        v(i3+1) = (v(i3+1)*c_explic + (f_det_scale*f(i3+1)+fln)*wfac) * c_implic
         call gauss(0.d0, rsd, fln)
-        v(i3+2) = (v(i3+2)*c_explic + (f(i3+2)+fln)*wfac) * c_implic
+        v(i3+2) = (v(i3+2)*c_explic + (f_det_scale*f(i3+2)+fln)*wfac) * c_implic
         call gauss(0.d0, rsd, fln)
-        v(i3+3) = (v(i3+3)*c_explic + (f(i3+3)+fln)*wfac) * c_implic
+        v(i3+3) = (v(i3+3)*c_explic + (f_det_scale*f(i3+3)+fln)*wfac) * c_implic
         i3 = i3 + 3
       end do
       if (ibelly > 0) then
@@ -3136,9 +3780,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         ! Skip some random numbers
         call gauss(0.d0, 1.d0, fln)
       end do
-#ifdef MPI /* SOFT CORE */
-    end if ! for (ifsc==1) call sc_lngdyn
-#endif
+    end if
   end if  ! ( gammai == 0.d0 )
   !  }}}
   ! End case switch for various thermostats
@@ -3237,6 +3879,12 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   endif
 
 !------------------------------------------------------------------------------
+  if (skip_standard_position_update) then
+    f(istart3:iend3) = xold(istart3:iend3)
+  end if
+
+!------------------------------------------------------------------------------
+  if (.not. skip_standard_position_update) then
   ! Step 3: update the positions, putting the "old" positions into F: {{{
   if (ischeme == 1) then
     ! middle scheme {{{
@@ -3282,8 +3930,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         v_lnv = c1v * v_lnv + fln
       end if
 #ifdef MPI
-      call mpi_bcast(v_lnv, 1, MPI_DOUBLE_PRECISION, 0, &
-                   commworld, ierr)
+      mpitmp(1) = v_lnv
+      call mpi_bcast(mpitmp, 1, MPI_DOUBLE_PRECISION, 0, commworld, ierr)
+      v_lnv = mpitmp(1)
 #endif
       aa = exp(dt25 * v_lnv)
       arg2 = v_lnv * dt25 * v_lnv * dt25
@@ -3346,6 +3995,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   end if
   !}}}
   ! End case branching for updating positions
+  end if
+
+  skip_standard_position_update = .false.
 
 !------------------------------------------------------------------------------
   !Nose'-Hoover thermostat (2nd step).{{{
@@ -3383,54 +4035,57 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
 !------------------------------------------------------------------------------
   if (ntc .ne. 1) then
-    ! Step 4a: if shake is being used, update the positions {{{
-    call timer_start(TIME_SHAKE)
-    if (ischeme == 1) xold(istart3:iend3) = x(istart3:iend3)
-   qspatial = .false.
-    call shake(nrp, nbonh, nbona, 0, ix(iibh), ix(ijbh), ix(ibellygp), &
-               winv, conp, skip, f, x, nitp, belly, ix(iifstwt), &
-               ix(noshake), qspatial)
-    call quick3(f, x, ix(iifstwr), natom, nres, ix(i02))
-    if (nitp == 0) then
-      erstop = .true.
-      goto 480
-    end if
-
-
-    ! Need to synchronize coordinates for linearly scaled atoms after shake
-#ifdef MPI
-    if (icfe .ne. 0) then
-      call timer_barrier( commsander )
-      call timer_stop_start(TIME_SHAKE,TIME_DISTCRD)
-      if (.not. mpi_orig .and. numtasks > 1) &
-        call xdist(x, xx(lfrctmp), natom)
-
-      ! In dual-topology this is done within softcore.f
-      if (ifsc .ne. 1) then
-        if (master) call mpi_bcast(x, nr3, MPI_DOUBLE_PRECISION, &
-                         0, commmaster, ierr)
-      else
-        if (master) call sc_sync_x(x, nr3)
+    if (.not. skip_outer_shake) then
+      ! Step 4a: if shake is being used, update the positions {{{
+      call timer_start(TIME_SHAKE)
+      if (ischeme == 1) xold(istart3:iend3) = x(istart3:iend3)
+      qspatial = .false.
+      call shake(nrp, nbonh, nbona, 0, ix(iibh), ix(ijbh), ix(ibellygp), &
+                 winv, conp, skip, f, x, nitp, belly, ix(iifstwt), &
+                 ix(noshake), qspatial)
+      call quick3(f, x, ix(iifstwr), natom, nres, ix(i02))
+      if (nitp == 0) then
+        erstop = .true.
+        goto 480
       end if
-      if (numtasks > 1) &
-        call mpi_bcast(x, nr3, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
-      call timer_stop_start(TIME_DISTCRD, TIME_SHAKE)
-    end if
+
+
+      ! Need to synchronize coordinates for linearly scaled atoms after shake
+#ifdef MPI
+      if (icfe .ne. 0) then
+        call timer_barrier( commsander )
+        call timer_stop_start(TIME_SHAKE,TIME_DISTCRD)
+        if (.not. mpi_orig .and. numtasks > 1) &
+          call xdist(x, xx(lfrctmp), natom)
+
+        ! In dual-topology this is done within softcore.f
+        if (ifsc .ne. 1) then
+          if (commmaster /= MPI_COMM_NULL) then
+            call mpi_bcast(x, nr3, MPI_DOUBLE_PRECISION, 0, commmaster, ierr)
+          end if
+        else
+          if (master) call sc_sync_x(x, nr3)
+        end if
+        if (numtasks > 1) &
+          call mpi_bcast(x, nr3, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+        call timer_stop_start(TIME_DISTCRD, TIME_SHAKE)
+      end if
 #endif  /* MPI */
 
 !------------------------------------------------------------------------------
-    ! Step 4b: Now fix the velocities and calculate KE.
-    ! Re-estimate the velocities from differences in positions.
-    if (.not. (ipimd == NMPIMD .and. ipimd == CMD .and. mybeadid .ne. 1)) then
-      if (ischeme == 0) then
-        v(istart3:iend3) = (x(istart3:iend3) - f(istart3:iend3))*dtxinv
-      else
-        v(istart3:iend3) = v(istart3:iend3) &
-          + (x(istart3:iend3) - xold(istart3:iend3))*dtxinv
+      ! Step 4b: Now fix the velocities and calculate KE.
+      ! Re-estimate the velocities from differences in positions.
+      if (.not. (ipimd == NMPIMD .and. ipimd == CMD .and. mybeadid .ne. 1)) then
+        if (ischeme == 0) then
+          v(istart3:iend3) = (x(istart3:iend3) - f(istart3:iend3))*dtxinv
+        else
+          v(istart3:iend3) = v(istart3:iend3) &
+            + (x(istart3:iend3) - xold(istart3:iend3))*dtxinv
+        end if
       end if
+      call timer_stop(TIME_SHAKE)
+      ! }}}
     end if
-    call timer_stop(TIME_SHAKE)
-    ! }}}
   end if
   call timer_start(TIME_VERLET)
 
@@ -3589,9 +4244,17 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
     ! Sum up the partial kinetic energies: {{{
 #ifdef MPI
     if (ipimd == CMD) then
-      call mpi_reduce(eke_cmd, tmp_eke_cmd, 1, MPI_DOUBLE_PRECISION, &
-                      mpi_sum, 0, commsander, ierr)
-      eke_cmd = tmp_eke_cmd
+      eke_cmd_buf(1) = eke_cmd
+#  ifdef USE_MPI_IN_PLACE
+      tmp_eke_cmd_buf(1) = eke_cmd_buf(1)
+      call mpi_allreduce(MPI_IN_PLACE, tmp_eke_cmd_buf, 1, MPI_DOUBLE_PRECISION, &
+                         mpi_sum, commsander, ierr)
+#  else
+      call mpi_allreduce(eke_cmd_buf, tmp_eke_cmd_buf, 1, MPI_DOUBLE_PRECISION, &
+                         mpi_sum, commsander, ierr)
+#  endif
+      eke_cmd = tmp_eke_cmd_buf(1)
+      tmp_eke_cmd = eke_cmd
     endif
 #  ifdef LES
     if (.not. mpi_orig .and. numtasks > 1) then
@@ -3604,10 +4267,10 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         eke = mpitmp(1)
         ekph = mpitmp(2)
 #    else
-        call mpi_allreduce(mpitmp, mpitmp(3), 2, MPI_DOUBLE_PRECISION, &
+        call mpi_allreduce(mpitmp, mpitmp_recv, 2, MPI_DOUBLE_PRECISION, &
                            mpi_sum, commsander, ierr)
-        eke = mpitmp(3)
-        ekph = mpitmp(4)
+        eke = mpitmp_recv(1)
+        ekph = mpitmp_recv(2)
 #    endif
       else
         mpitmp(1) = eke
@@ -3622,12 +4285,12 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         ekeles = mpitmp(3)
         ekphles = mpitmp(4)
 #    else
-        call mpi_allreduce(mpitmp, mpitmp(5), 4, MPI_DOUBLE_PRECISION, &
+        call mpi_allreduce(mpitmp, mpitmp_recv, 4, MPI_DOUBLE_PRECISION, &
                            mpi_sum, commsander, ierr)
-        eke = mpitmp(5)
-        ekph = mpitmp(6)
-        ekeles = mpitmp(7)
-        ekphles = mpitmp(8)
+        eke = mpitmp_recv(1)
+        ekph = mpitmp_recv(2)
+        ekeles = mpitmp_recv(3)
+        ekphles = mpitmp_recv(4)
 #    endif
       endif
     end if
@@ -3644,11 +4307,11 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
       ekph = mpitmp(2)
       ekpbs = mpitmp(3)
 #    else
-      call mpi_allreduce(mpitmp, mpitmp(4), 3, MPI_DOUBLE_PRECISION, &
+      call mpi_allreduce(mpitmp, mpitmp_recv, 3, MPI_DOUBLE_PRECISION, &
                          mpi_sum, commsander, ierr)
-      eke = mpitmp(4)
-      ekph = mpitmp(5)
-      ekpbs = mpitmp(6)
+      eke = mpitmp_recv(1)
+      ekph = mpitmp_recv(2)
+      ekpbs = mpitmp_recv(3)
 #    endif
     end if
 #  endif
@@ -3715,7 +4378,11 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
             ! the subroutine also correctly scales the softcore atom v's
             call mix_temp_scaling(scaltp, v)
           end if
-          call mpi_bcast(scaltp, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+          if (numtasks > 1) then
+            scaltp_buf(1) = scaltp
+            call mpi_bcast(scaltp_buf, 1, MPI_DOUBLE_PRECISION, 0, commsander, ierr)
+            scaltp = scaltp_buf(1)
+          end if
         end if
       end if
 #endif /* MPI */
@@ -3831,7 +4498,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
   call timer_barrier(commsander)
   call timer_stop_start(TIME_VERLET,TIME_DISTCRD)
   if (.not. mpi_orig .and. numtasks > 1) then
-    !write(6,'(a)') 'DEBUG: Calling XDIST for coordinates.'
+    
     call xdist(x, xx(lfrctmp), natom)
     if (isynctraj.ne.0.and.itdump) call xdist(onstepcrd, xx(lfrctmp), natom) 
   endif
@@ -3848,8 +4515,9 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
     ! In dual-topology this is done within softcore.f
     if (ifsc .ne. 1) then
-      if (master) &
+      if (commmaster /= MPI_COMM_NULL) then
         call mpi_bcast(x, nr3, MPI_DOUBLE_PRECISION, 0, commmaster, ierr)
+      end if
     else
       if (master) then
 
@@ -3991,9 +4659,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
         ! The array onefac is the inverse of the array fac
         atempdrop = 0.5d0 * tmass * vel2 * onefac(1)
         vel = sqrt(vel2)
-        if (master) &
-          write (6, '(a,f15.6,f9.2,a)') 'check COM velocity, temp: ', vel, &
-                atempdrop, '(Removed)'
+        ! Suppress noisy COM diagnostics that were primarily intended for debugging
         do i = 1, 3*natom, 3
           v(i) = v(i) - vcmx
           v(i+1) = v(i+1) - vcmy
@@ -4454,9 +5120,12 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 
 #ifndef LES
 #  ifdef MPI
-    if (master .and. (ipimd > 0 .or. ineb > 0)) &
-      call mpi_reduce(ener%kin%tot, totener%kin%tot, 1, &
+    if (master .and. (ipimd > 0 .or. ineb > 0)) then
+      ener_kin_tot_buf(1) = ener%kin%tot
+      call mpi_reduce(ener_kin_tot_buf, totener_kin_tot_buf, 1, &
                       MPI_DOUBLE_PRECISION, mpi_sum, 0, commmaster, ierr)
+      totener%kin%tot = totener_kin_tot_buf(1)
+    end if
 #  endif /* MPI */
 
 !------------------------------------------------------------------------------
@@ -4480,32 +5149,6 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #endif /* LES is not defined */
     kinetic_E_save(2) = kinetic_E_save(1)
     kinetic_E_save(1) = ener%kin%tot
-    if (fires == 1) then
-#ifdef MPI
-  if (master) then
-#endif
-    write(6,'(a,3(1x,1pe16.7))') 'JOSE FIRES: F_pot(anchor)=', last_f_pot(1), last_f_pot(2), last_f_pot(3)
-    write(6,'(a,3(1x,1pe16.7))') 'JOSE FIRES: F_inner_water =', last_f_inner_water(1), last_f_inner_water(2), last_f_inner_water(3)
-    write(6,'(a,3(1x,1pe16.7))') 'JOSE FIRES: F_penetrating_water =', last_f_pen_water(1), last_f_pen_water(2), last_f_pen_water(3)
-    write(6,'(a,3(1x,1pe16.7))') 'JOSE FIRES: Sum(anchor+innerW+penW) =', &
-     last_f_pot(1)+last_f_inner_water(1)+last_f_pen_water(1), &
-     last_f_pot(2)+last_f_inner_water(2)+last_f_pen_water(2), &
-     last_f_pot(3)+last_f_inner_water(3)+last_f_pen_water(3)
-  write(6,'(a,i0,a,i0,a,1pe11.4,a,i0)') 'JOSE FIRES: counts: penetrating outer = ', last_n_pen, &
-  ', inner water outside = ', last_n_inw_out, ' | rmax = ', last_rmax, ', anchor = ', last_anchor_idx
-    write(6,'(a,1pe16.7)') 'JOSE FIRES: farthest inner-solvent distance = ', last_rmax_inw
-    write(6,'(a,i0)') 'JOSE  FIRES: farthest inner-solvent atom index = ', last_inw_max_idx
-    if (last_pen_atom_idx > 0) then
-      write(6,'(a,i0,a,1pe16.7,a,1pe16.7)') 'JOSE FIRES: deepest outer penetration: atom=', last_pen_atom_idx, &
-        ' r=', last_pen_r, ' depth=(rmax-r)=', last_pen_depth
-    else
-      write(6,'(a)') 'JOSE FIRES: deepest outer penetration: none'
-    end if
-#ifdef MPI
- end if
-#endif
-  end if
-    
   end if
   ! End contingency to calculate energies when on a reportable step
 
@@ -4931,53 +5574,54 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
 #  endif /* MPI */
       end if
 #endif /* LES */
-      call prntmd(total_nstep, t, ener, onefac, 7, .false.)
-      if (ischeme > 0 .and. rem == 0 .and. master) then
-        write(fh_ek, '(I10,2(1x,F14.4))') nstep, ekph, ekph*onefac(1)
-      endif
+      if (lout) then
+        call prntmd(total_nstep, t, ener, onefac, 7, .false.)
+        if (ischeme > 0 .and. rem == 0 .and. master) then
+          write(fh_ek, '(I10,2(1x,F14.4))') nstep, ekph, ekph*onefac(1)
+        endif
 
 #ifdef MPI
-      ! AWG FIXME - this should be in a subroutine
+        ! AWG FIXME - this should be in a subroutine
       ! Print corrected energy for adaptive qm/mm runs.
       ! Note: nstep has already been increased here
       !       (it was not increased when adaptive_qmmm() was called above)
-      if (qmmm_nml%vsolv > 1) then
-        if (masterrank == 0) then
-          if (aqmmm_flag > 0 .and. nstep > aqmmm_flag) then
-            etotcorr = corrected_energy + kinetic_E_save(aqmmm_flag)
-            nstepadc = nstep - aqmmm_flag + 1
-            tadc = t - dt * (dble(aqmmm_flag - 1))
-            write(6, '(a)') ' Adaptive QM/MM energies:'
-            write(6, '(x,a,i5,x,a,f11.4,x,2(a,f15.4,x))') 'adQMMM STEP=', &
-                  nstepadc, 'TIME(PS)=', tadc, 'ETC=', etotcorr, &
-                  'EPC=', corrected_energy
+        if (qmmm_nml%vsolv > 1) then
+          if (masterrank == 0) then
+            if (aqmmm_flag > 0 .and. nstep > aqmmm_flag) then
+              etotcorr = corrected_energy + kinetic_E_save(aqmmm_flag)
+              nstepadc = nstep - aqmmm_flag + 1
+              tadc = t - dt * (dble(aqmmm_flag - 1))
+              write(6, '(a)') ' Adaptive QM/MM energies:'
+              write(6, '(x,a,i5,x,a,f11.4,x,2(a,f15.4,x))') 'adQMMM STEP=', &
+                    nstepadc, 'TIME(PS)=', tadc, 'ETC=', etotcorr, &
+                    'EPC=', corrected_energy
 
-            ! print total energy for adaptive qm/mm into a separate file
-            ! when qmmm_vsolv%verbosity > 0
-            ! set reference energy to zero only for energy dumping purposes
-            if (flag_first_energy) then
-              flag_first_energy = .false.
-              adqmmm_first_energy = etotcorr
-              etotcorr = 0.0d0
-            else
-              etotcorr = etotcorr - adqmmm_first_energy
-            end if
-            if (qmmm_vsolv%verbosity > 0) then
-              open(80,file='adqmmm_tot_energy.dat',position='append')
-              write(80,'(i9,5x,f11.4,5x,f15.4)') nstepadc, tadc, etotcorr
-              close(80)
+              ! print total energy for adaptive qm/mm into a separate file
+              ! when qmmm_vsolv%verbosity > 0
+              ! set reference energy to zero only for energy dumping purposes
+              if (flag_first_energy) then
+                flag_first_energy = .false.
+                adqmmm_first_energy = etotcorr
+                etotcorr = 0.0d0
+              else
+                etotcorr = etotcorr - adqmmm_first_energy
+              end if
+              if (qmmm_vsolv%verbosity > 0) then
+                open(80,file='adqmmm_tot_energy.dat',position='append')
+                write(80,'(i9,5x,f11.4,5x,f15.4)') nstepadc, tadc, etotcorr
+                close(80)
+              end if
             end if
           end if
         end if
-      end if
 #endif
 
 #ifdef MPI /* SOFT CORE */
-      if (ifsc .ne. 0) call sc_print_energies(6, sc_ener)
-      if (ifsc .ne. 0) call sc_print_energies(7, sc_ener)
+        if (ifsc .ne. 0) call sc_print_energies(6, sc_ener)
+        if (ifsc .ne. 0) call sc_print_energies(7, sc_ener)
 #endif
-      if (ifcr > 0 .and. crprintcharges > 0) &
-        call cr_print_charge(xx(l15), total_nstep)
+        if (ifcr > 0 .and. crprintcharges > 0) &
+          call cr_print_charge(xx(l15), total_nstep)
 
 !------------------------------------------------------------------------------
       ! Output for Centroid MD
@@ -5083,6 +5727,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
                       nres, 'PRNT')
       end if
       call amflsh(7)
+    end if
     end if
     ! end of giant "if (lout)" contingency related to data output }}}
 

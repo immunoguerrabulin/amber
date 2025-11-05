@@ -34,9 +34,11 @@
 !   nstep:          The step number
 !------------------------------------------------------------------------------
 subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
-                 onereff, qsetup, do_list_update, nstep)
+                 onereff, qsetup, do_list_update, nstep, skip_slow, f_slow_out)
 
-  use qmmm_fires_module, only: fires,fires_force,fire_inner,fire_outer, mts_fires, mts_n  !JOSE MOD: include MTS controls
+  use qmmm_fires_module, only: fires, fires_force, fire_inner, fire_outer, mts_fires, mts_n, &
+                               fires_in_force, fires_set_step, fires_set_local_bounds, &
+                               fires_prepare_if_needed  !JOSE MOD: include MTS controls
   
 #if !defined(DISABLE_NFE)
   use nfe_sander_hooks, only: nfe_on_force => on_force
@@ -212,9 +214,14 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
   _REAL_ eextpot
   _REAL_ enemap
   _REAL_ xray_e
+  logical :: lskip_slow, want_slow_out
+  integer :: local_span, istart3_local, iend3_local
+  _REAL_, allocatable :: fslow(:)
 
   logical, intent(inout) :: qsetup
   logical, intent(out) :: do_list_update
+  logical, intent(in),  optional :: skip_slow
+  _REAL_, intent(out),   optional :: f_slow_out(:)
 
   _REAL_  enmr(6), devdis(4), devang(4), devtor(4), devpln(4), devplpt(4), &
        devgendis(4), entr, ecap, enfe
@@ -298,6 +305,12 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
       ntf = 7
   end if
 
+  lskip_slow    = .false.
+  if (present(skip_slow)) lskip_slow = skip_slow
+  want_slow_out = present(f_slow_out)
+  if (want_slow_out) f_slow_out = 0.0d0
+  local_span = 0
+
   call trace_enter( 'force' )
 
   call timer_start(TIME_FORCE)
@@ -349,6 +362,18 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
   istart = 1
   iend = natom
 #endif /* MPI */
+
+  istart3_local = 3*(istart - 1) + 1
+  iend3_local   = 3*iend
+  if (iend >= istart) then
+    local_span = iend3_local - istart3_local + 1
+  else
+    local_span = 0
+  end if
+  if (want_slow_out .and. local_span > 0) then
+    allocate(fslow(local_span))
+    fslow = 0.0d0
+  end if
 
   ! QM/MM variable QM solvent scheme
   if (qmmm_nml%ifqnt .and. qmmm_nml%vsolv > 0) then
@@ -1219,10 +1244,26 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
 #endif
 
 
-
-  if (fires==1) then
-    !JOSE MOD: FIRES is the fast force — evaluate every step (no MTS caching)
-    call fires_force(x,xx(lmass),natom,f,efires)
+  ! Ensure FIRES energy is initialized
+  efires = 0.0d0
+  fires_in_force = .false.
+  call fires_set_step(nstep)
+  ! When not using MTS, force() handles FIRES forces/energy once per outer step
+  if (fires == 1 .and. ipimd == 0) then
+    if (.not. (mts_n > 1 .and. mts_fires > 0.0d0)) then
+      if (.not. lskip_slow) then
+        if (want_slow_out .and. local_span > 0) then
+          fslow(1:local_span) = f(istart3_local:iend3_local)
+        end if
+        call fires_set_local_bounds(istart3_local, iend3_local)
+        call fires_prepare_if_needed(x, xx(lmass), natom)
+        call fires_force(x, xx(lmass), natom, f, efires)
+        if (want_slow_out .and. local_span > 0) then
+          fslow(1:local_span) = f(istart3_local:iend3_local) - fslow(1:local_span)
+        end if
+        fires_in_force = .true.
+      end if
+    end if
   end if
  
   
@@ -1344,7 +1385,7 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
   endif
 #endif
   pot%constraint = pot%constraint + eshf + epcshf + pot%noe + &
-                   sum(enmr(1:6)) + ealign + ecsa + pot%emap + enfe
+                   sum(enmr(1:6)) + ealign + ecsa + pot%emap + enfe + efires
                    
   ! In this case the external potential is treated as a constraint.
   ! If it catches on we can make a new separate record.
@@ -1355,6 +1396,12 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
 #ifdef DSSP
   pot%constraint = pot%constraint + edssp
 #endif
+  ! Add FIRES energy to the restraint bucket in non-MTS runs only (handled here)
+  if (fires == 1 .and. ipimd == 0) then
+    if (.not. (mts_n > 1 .and. mts_fires > 0.0d0)) then
+      pot%constraint = pot%constraint + efires
+    end if
+  end if
   pot%polar = epolar
 
 
@@ -1618,7 +1665,13 @@ subroutine force(xx, ix, ih, ipairs, x, f, ener, vir, fs, rborn, reff, &
 !      write(6,'(i4,a,3F15.5)')i," crd ",xx(lcrd+(i-1)*3),xx(lcrd+1+(i-1)*3),xx(lcrd+2+(i-1)*3)
 !  end do
 
-  
+  if (want_slow_out) then
+    if (local_span > 0) then
+      f_slow_out(1:local_span) = fslow(1:local_span)
+    end if
+  end if
+  if (allocated(fslow)) deallocate(fslow)
+
   ! End force computations and exit
   call timer_stop(TIME_FORCE)
   call trace_exit('force')
